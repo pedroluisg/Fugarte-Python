@@ -283,7 +283,7 @@ async def sesiones_realizadas(env: dict):
 
 
 # =========================================================
-# HOSTINGER API & EXTRACCIÓN DE CORREOS
+# HOSTINGER API & EXTRACCIÓN INTELIGENTE DE CORREOS
 # =========================================================
 
 async def hostinger_get(path: str, env: dict) -> dict:
@@ -350,6 +350,55 @@ def extract_time_from_mail(text: str) -> str:
     if m:
         return f"{m.group(1).zfill(2)}:00"
     return ""
+
+
+def extract_after_from_mail(text: str) -> str:
+    m = re.search(r"(?:a partir de|desde|después de|a las)\s*([01]?\d|2[0-3])(?:[:h\.]([0-5]\d))?", text, re.IGNORECASE)
+    if m:
+        return f"{m.group(1).zfill(2)}:{m.group(2) or '00'}"
+    return ""
+
+
+def extract_before_from_mail(text: str) -> str:
+    m = re.search(r"(?:antes de|hasta|no más tarde de)\s*([01]?\d|2[0-3])(?:[:h\.]([0-5]\d))?", text, re.IGNORECASE)
+    if m:
+        return f"{m.group(1).zfill(2)}:{m.group(2) or '00'}"
+    return ""
+
+
+def minutes_of(time_str: str) -> Optional[int]:
+    m = re.match(r"^(\d{2}):(\d{2})$", time_str or "")
+    if not m:
+        return None
+    return int(m.group(1)) * 60 + int(m.group(2))
+
+
+def resolver_hora_flexible(text: str, after: str, before: str) -> str:
+    """
+    Si no hay hora exacta pero hay rango/preferencia (ej. 'a las 10 u 11', 'a partir de las 17'),
+    prioriza 12:00 para mañanas o 18:30 para tardes respetando los límites del cliente.
+    """
+    texto_lower = text.lower()
+    es_tarde = any(w in texto_lower for w in ["tarde", "noches", "vesprada", "pm", "17:", "18:", "19:", "20:", "21:"])
+    
+    objetivo_minutos = 18 * 60 + 30 if es_tarde else 12 * 60  # 18:30 o 12:00
+    
+    min_m = minutes_of(after) if after else (16 * 60 if es_tarde else 9 * 60)
+    max_m = minutes_of(before) if before else (22 * 60 if es_tarde else 15 * 60)
+    
+    mejor_slot = None
+    menor_distancia = 999999
+    
+    for h in range(0, 24):
+        for m in range(0, 60, 30):
+            total_m = h * 60 + m
+            if min_m <= total_m <= max_m:
+                dist = abs(total_m - objetivo_minutos)
+                if dist < menor_distancia:
+                    menor_distancia = dist
+                    mejor_slot = f"{str(h).zfill(2)}:{str(m).zfill(2)}"
+                    
+    return mejor_slot or ("18:30" if es_tarde else "12:00")
 
 
 def extract_players_from_mail(text: str) -> Optional[int]:
@@ -420,17 +469,20 @@ async def revisar_correo_logic(env: dict):
 
         fecha = extract_date_from_mail(text)
         hora_solicitada = extract_time_from_mail(text)
+        after = extract_after_from_mail(text)
+        before = extract_before_from_mail(text)
+        
+        # Si no hay hora exacta pero hay preferencias/rangos, aplicar la lógica inteligente
+        if not hora_solicitada and (after or before or "tarde" in text.lower() or "mañana" in text.lower() or "10" in text or "11" in text or "17" in text):
+            hora_solicitada = resolver_hora_flexible(text, after, before)
+
         jugadores = extract_players_from_mail(text)
         version = extract_version_from_mail(text)
         telefono = extract_phone_from_mail(text)
         nombre = extract_name_from_mail(text, subject)
 
-        if not fecha or jugadores is None:
+        if not fecha or jugadores is None or not hora_solicitada:
             continue
-
-        if not hora_solicitada:
-            actions.append({"type": "REVIEW", "uid": uid, "subject": subject, "nombre": nombre, "reason": "No se pudo determinar la hora."})
-            break
 
         # Crear solicitud en Notion
         dt_base = datetime.fromisoformat(fecha + "T" + hora_solicitada + ":00").replace(tzinfo=TZ)
@@ -448,11 +500,11 @@ async def revisar_correo_logic(env: dict):
                 "Versión": {"select": {"name": version}},
                 "Origen": {"select": {"name": "WEB"}},
                 "Teléfono": {"phone_number": telefono} if telefono else {"phone_number": None},
-                "Notas": {"rich_text": [{"text": {"content": f"Solicitud recibida por Hostinger INBOX. UID {uid}."}}]}
+                "Notas": {"rich_text": [{"text": {"content": f"Solicitud recibida por Hostinger INBOX. UID {uid}. Hora calculada/ajustada."}}]}
             }
         })
 
-        # Mover correo a INBOX.Aceptadas de forma segura para evitar duplicados
+        # Mover correo a INBOX.Aceptadas para evitar duplicados
         try:
             await hostinger_move(env, uid)
         except Exception:
@@ -479,7 +531,7 @@ async def revisar_correo_logic(env: dict):
             "version": version,
             "telefono": telefono,
             "whatsapp": wa(telefono, mensaje),
-            "reason": "Solicitud creada en Notion y correo movido a INBOX.Aceptadas."
+            "reason": "Solicitud creada en Notion (con hora inteligente óptima) y correo movido a INBOX.Aceptadas."
         })
         break
 
