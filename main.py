@@ -313,7 +313,7 @@ async def hostinger_move(env: dict, uid: str) -> bool:
     if not (200 <= r.status_code < 300):
         async with httpx.AsyncClient() as client2:
             await client2.post(
-                "https://api.hostinger.com/api/v1/mailboxes/" + HOSTINGER_MAILBOX + "/folders/INBOX/messages/" + urllib.parse.quote(uid) + "/move",
+                "https://api.mail.hostinger.com/api/v1/mailboxes/" + HOSTINGER_MAILBOX + "/folders/INBOX/messages/" + urllib.parse.quote(uid) + "/move",
                 headers={"Authorization": "Bearer " + env.get("HOSTINGER_TOKEN", ""), "Content-Type": "application/json"},
                 json={"targetFolder": "INBOX.Aceptadas"}
             )
@@ -374,10 +374,6 @@ def minutes_of(time_str: str) -> Optional[int]:
 
 
 def resolver_hora_flexible(text: str, after: str, before: str) -> str:
-    """
-    Si no hay hora exacta pero hay rango/preferencia (ej. 'a las 10 u 11', 'a partir de las 17'),
-    prioriza 12:00 para mañanas o 18:30 para tardes respetando los límites del cliente.
-    """
     texto_lower = text.lower()
     es_tarde = any(w in texto_lower for w in ["tarde", "noches", "vesprada", "pm", "17:", "18:", "19:", "20:", "21:"])
     
@@ -431,14 +427,9 @@ def extract_phone_from_mail(text: str) -> str:
 
 
 def extract_version_from_mail(text: str) -> str:
-    # Normalizar texto eliminando acentos y convirtiendo a mayúsculas
     contenido = re.sub(r"[\u0300-\u036f]", "", text or "").upper()
-    
-    # Buscar la palabra PRO como palabra independiente (delimitada por espacios o símbolos)
-    # para evitar falsos positivos con otras palabras.
     if re.search(r"\bPRO\b", contenido):
         return "PRO"
-    
     return "NORMAL"
 
 
@@ -477,7 +468,6 @@ async def revisar_correo_logic(env: dict):
         after = extract_after_from_mail(text)
         before = extract_before_from_mail(text)
         
-        # Si no hay hora exacta pero hay preferencias/rangos, aplicar la lógica inteligente
         if not hora_solicitada and (after or before or "tarde" in text.lower() or "mañana" in text.lower() or "10" in text or "11" in text or "17" in text):
             hora_solicitada = resolver_hora_flexible(text, after, before)
 
@@ -489,7 +479,6 @@ async def revisar_correo_logic(env: dict):
         if not fecha or jugadores is None or not hora_solicitada:
             continue
 
-        # Crear solicitud en Notion
         dt_base = datetime.fromisoformat(fecha + "T" + hora_solicitada + ":00").replace(tzinfo=TZ)
         hora_utc = dt_base.astimezone(zoneinfo.ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
 
@@ -505,11 +494,10 @@ async def revisar_correo_logic(env: dict):
                 "Versión": {"select": {"name": version}},
                 "Origen": {"select": {"name": "WEB"}},
                 "Teléfono": {"phone_number": telefono} if telefono else {"phone_number": None},
-                "Notas": {"rich_text": [{"text": {"content": f"Solicitud recibida por Hostinger INBOX. UID {uid}. Hora calculada/ajustada."}}]}
+                "Notas": {"rich_text": [{"text": {"content": f"Solicitud recibida por Hostinger INBOX. UID {uid}."}}]}
             }
         })
 
-        # Mover correo a INBOX.Aceptadas para evitar duplicados
         try:
             await hostinger_move(env, uid)
         except Exception:
@@ -536,7 +524,7 @@ async def revisar_correo_logic(env: dict):
             "version": version,
             "telefono": telefono,
             "whatsapp": wa(telefono, mensaje),
-            "reason": "Solicitud creada en Notion (con hora inteligente óptima) y correo movido a INBOX.Aceptadas."
+            "reason": "Solicitud creada en Notion y correo movido a INBOX.Aceptadas."
         })
         break
 
@@ -636,7 +624,7 @@ async def api_revisar_correo():
 
 
 # =========================================================
-# HTML FRONTEND (INTERFAZ ORIGINAL COMPLETA)
+# HTML FRONTEND (INTERFAZ ORIGINAL COMPLETA + DESPLEGABLE SESIONES)
 # =========================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -666,6 +654,8 @@ button,.wa{display:block;width:100%;padding:13px;border:0;border-radius:10px;bac
 .empty{text-align:center;color:#666;padding:20px}
 .badge{display:inline-block;padding:4px 8px;border-radius:8px;background:#eee;margin-top:5px;font-size:13px}
 .error{color:#b91c1c;font-weight:bold}
+.dropdown-btn{background:#4b5563;margin-top:8px}
+.dropdown-content{display:none;margin-top:10px;padding-left:10px;border-left:3px solid #e5e7eb}
 </style>
 </head>
 <body>
@@ -702,6 +692,8 @@ if(value===null||value===undefined||value===""){return fallback||"";}
 return String(value);
 }
 
+let globalSesiones = [];
+
 async function cargar(){
 const sol=document.getElementById("sol");
 const res=document.getElementById("res");
@@ -735,7 +727,10 @@ else{sol.innerHTML='<div class="error">❌ Error al cargar las solicitudes: '+sa
 if(resultados[1].status==="fulfilled"){mostrarReservas(resultados[1].value);}
 else{res.innerHTML='<div class="error">❌ Error al cargar las reservas: '+safe(resultados[1].reason?.message,"error")+'</div>';}
 
-if(resultados[2].status==="fulfilled"){mostrarSesiones(resultados[2].value);}
+if(resultados[2].status==="fulfilled"){
+globalSesiones = resultados[2].value;
+mostrarSesionesDesplegable(globalSesiones);
+}
 else{ses.innerHTML='<div class="error">❌ Error al cargar las sesiones: '+safe(resultados[2].reason?.message,"error")+'</div>';}
 }
 
@@ -841,14 +836,65 @@ output+="</div>";
 document.getElementById("res").innerHTML=output;
 }
 
-function mostrarSesiones(a){
+function mostrarSesionesDesplegable(a){
 if(!Array.isArray(a)||!a.length){document.getElementById("ses").innerHTML='<div class="empty">Todavía no hay sesiones.</div>';return;}
-let output="";
-a.slice(0,30).forEach(function(x){
-output+='<div class="card"><strong>'+safe(x.nombre,"Sin nombre")+"</strong>";
-output+='<div class="info">📅 '+safe(x.fechaTexto)+"<br>🕐 "+safe(x.horaTexto)+"<br>👥 "+safe(x.jugadores)+" personas<br>🎯 "+safe(x.version)+"<br>💶 Pago: "+safe(x.pago,"RECIBIDO")+"</div></div>";
+
+// Agrupar por año y mes
+const arbol = {};
+const mesesNombres = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
+
+a.forEach(function(x){
+if(!x.fecha) return;
+const partes = x.fecha.split("-");
+if(partes.length < 2) return;
+const anio = partes[0];
+const mesNum = parseInt(partes[1], 10);
+const mesNombre = mesesNombres[mesNum] || partes[1];
+
+if(!arbol[anio]) arbol[anio] = {};
+if(!arbol[anio][mesNombre]) arbol[anio][mesNombre] = [];
+arbol[anio][mesNombre].push(x);
 });
-document.getElementById("ses").innerHTML=output;
+
+const aniosOrdenados = Object.keys(arbol).sort().reverse();
+let output = "";
+
+aniosOrdenados.forEach(function(anio){
+output += `<button class="dropdown-btn" onclick="toggleAnio('${anio}')">📁 Año ${anio} ▾</button>`;
+output += `<div id="anio-${anio}" class="dropdown-content">`;
+
+const mesesOrdenados = Object.keys(arbol[anio]).sort(function(m1, m2){
+return mesesNombres.indexOf(m2) - mesesNombres.indexOf(m1);
+});
+
+mesesOrdenados.forEach(function(mes){
+output += `<button class="dropdown-btn" onclick="toggleMes('${anio}', '${mes}')" style="background:#6b7280; font-size:15px;">📂 ${mes} ▾</button>`;
+output += `<div id="mes-${anio}-${mes}" class="dropdown-content">`;
+
+arbol[anio][mes].forEach(function(x){
+output += `<div class="card" style="margin-top:8px; margin-bottom:8px; background:#f9fafb;">`;
+output += `<strong>${safe(x.nombre,"Sin nombre")}</strong>`;
+output += `<div class="info">📅 ${safe(x.fechaTexto)}<br>🕐 ${safe(x.horaTexto)}<br>👥 ${safe(x.jugadores)} personas<br>🎯 ${safe(x.version)}<br>💶 Pago: ${safe(x.pago,"RECIBIDO")}</div>`;
+output += `</div>`;
+});
+
+output += `</div>`;
+});
+
+output += `</div>`;
+});
+
+document.getElementById("ses").innerHTML = output || '<div class="empty">Todavía no hay sesiones.</div>';
+}
+
+function toggleAnio(anio){
+const el = document.getElementById("anio-" + anio);
+if(el){ el.style.display = (el.style.display === "block") ? "none" : "block"; }
+}
+
+function toggleMes(anio, mes){
+const el = document.getElementById("mes-" + anio + "-" + mes);
+if(el){ el.style.display = (el.style.display === "block") ? "none" : "block"; }
 }
 
 cargar();
