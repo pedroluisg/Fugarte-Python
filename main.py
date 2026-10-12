@@ -125,6 +125,7 @@ def hora(p: Any) -> str:
     if not val:
         return ""
     
+    # Si viene en formato ISO con hora (ej. 2026-06-01T17:00:00Z o con offset), ajustarlo a la zona horaria TZ de Madrid
     try:
         if "T" in val or ":" in val:
             if not val.endswith("Z") and "+" not in val and "-" not in val[10:]:
@@ -303,18 +304,6 @@ async def hostinger_get(path: str, env: dict) -> dict:
     return data
 
 
-async def hostinger_move(env: dict, uid: str) -> bool:
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            "https://api.hostinger.com/api/v1/mailboxes/" + HOSTINGER_MAILBOX + "/folders/INBOX/messages/" + uid + "/move",
-            headers={"Authorization": "Bearer " + env.get("HOSTINGER_TOKEN", ""), "Content-Type": "application/json"},
-            json={"targetFolder": "INBOX.Aceptadas"}
-        )
-    if not (200 <= r.status_code < 300):
-        raise HTTPException(status_code=r.status_code, detail="No se pudo mover el correo en Hostinger")
-    return True
-
-
 def extract_date_from_mail(text: str) -> str:
     m = re.search(r"\b(20\d{2})[-\/](\d{1,2})[-\/](\d{1,2})\b", text)
     if m:
@@ -374,12 +363,6 @@ async def revisar_correo_logic(env: dict):
         if not fecha or jugadores is None:
             continue
 
-        # Mover correo a la carpeta INBOX.Aceptadas para evitar que se relea
-        try:
-            await hostinger_move(env, uid)
-        except Exception:
-            pass
-
         actions.append({
             "type": "CREATED" if hora_solicitada else "REVIEW",
             "uid": uid,
@@ -387,7 +370,7 @@ async def revisar_correo_logic(env: dict):
             "fecha": fecha,
             "hora": hora_solicitada,
             "jugadores": jugadores,
-            "reason": "Correo analizado y movido a INBOX.Aceptadas."
+            "reason": "Correo analizado correctamente desde Hostinger."
         })
         break
 
@@ -499,7 +482,7 @@ async function cargar(){
 async function revisarCorreo(){
   document.getElementById("mailStatus").textContent="Revisando...";
   const r = await fetch("/api/revisar-correo",{method:"POST"}).then(x=>x.json());
-  document.getElementById("mailStatus").textContent="✅ Correo revisado y movido.";
+  document.getElementById("mailStatus").textContent="✅ Correo revisado.";
   cargar();
 }
 async function confirmar(id){ if(confirm("¿Confirmar?")){ await fetch("/api/confirmar-solicitud",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({requestId:id})}); cargar(); } }
