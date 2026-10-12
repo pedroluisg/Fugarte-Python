@@ -114,28 +114,13 @@ def date_prop(p: Any) -> str:
 def hora(p: Any) -> str:
     if not p:
         return ""
-    val = ""
     if p.get("date") and p["date"].get("start"):
-        val = p["date"]["start"]
-    elif isinstance(p.get("rich_text"), list) and len(p["rich_text"]) > 0:
-        val = p["rich_text"][0].get("plain_text", "")
-    elif isinstance(p.get("title"), list) and len(p["title"]) > 0:
-        val = p["title"][0].get("plain_text", "")
-    
-    if not val:
-        return ""
-    
-    # Si viene en formato ISO con hora (ej. 2026-06-01T17:00:00Z o con offset), ajustarlo a la zona horaria TZ de Madrid
-    try:
-        if "T" in val or ":" in val:
-            if not val.endswith("Z") and "+" not in val and "-" not in val[10:]:
-                val += "Z"
-            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
-            return dt.astimezone(TZ).strftime("%H:%M")
-    except Exception:
-        pass
-    
-    return val
+        return p["date"]["start"]
+    if isinstance(p.get("rich_text"), list) and len(p["rich_text"]) > 0:
+        return p["rich_text"][0].get("plain_text", "")
+    if isinstance(p.get("title"), list) and len(p["title"]) > 0:
+        return p["title"][0].get("plain_text", "")
+    return ""
 
 
 # =========================================================
@@ -304,6 +289,18 @@ async def hostinger_get(path: str, env: dict) -> dict:
     return data
 
 
+async def hostinger_move(env: dict, uid: str) -> bool:
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            "https://api.hostinger.com/api/v1/mailboxes/" + HOSTINGER_MAILBOX + "/folders/INBOX/messages/" + uid + "/move",
+            headers={"Authorization": "Bearer " + env.get("HOSTINGER_TOKEN", ""), "Content-Type": "application/json"},
+            json={"targetFolder": "INBOX.Aceptadas"}
+        )
+    if not (200 <= r.status_code < 300):
+        raise HTTPException(status_code=r.status_code, detail="No se pudo mover el correo en Hostinger")
+    return True
+
+
 def extract_date_from_mail(text: str) -> str:
     m = re.search(r"\b(20\d{2})[-\/](\d{1,2})[-\/](\d{1,2})\b", text)
     if m:
@@ -372,7 +369,7 @@ async def revisar_correo_logic(env: dict):
             "jugadores": jugadores,
             "reason": "Correo analizado correctamente desde Hostinger."
         })
-        break
+        break # Se detiene en el primero igual que el original
 
     return actions
 
