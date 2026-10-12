@@ -431,9 +431,14 @@ def extract_phone_from_mail(text: str) -> str:
 
 
 def extract_version_from_mail(text: str) -> str:
-    contenido = re.sub(r"[\u0300-\u036f]", "", text).upper()
-    if "PRO" in contenido:
+    # Normalizar texto eliminando acentos y convirtiendo a mayúsculas
+    contenido = re.sub(r"[\u0300-\u036f]", "", text or "").upper()
+    
+    # Buscar la palabra PRO como palabra independiente (delimitada por espacios o símbolos)
+    # para evitar falsos positivos con otras palabras.
+    if re.search(r"\bPRO\b", contenido):
         return "PRO"
+    
     return "NORMAL"
 
 
