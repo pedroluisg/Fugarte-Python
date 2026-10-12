@@ -3,6 +3,7 @@ import zoneinfo
 import re
 import os
 import httpx
+import urllib.parse
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -190,7 +191,6 @@ def wa(tel: str, msg: str) -> str:
     n = re.sub(r"\D", "", str(tel))
     if not n:
         return ""
-    import urllib.parse
     return "https://wa.me/" + n + "?text=" + urllib.parse.quote(msg)
 
 
@@ -311,7 +311,6 @@ async def hostinger_move(env: dict, uid: str) -> bool:
             json={"targetFolder": "INBOX.Aceptadas"}
         )
     if not (200 <= r.status_code < 300):
-        # Fallback a URL alternativa si la API difiere ligeramente
         async with httpx.AsyncClient() as client2:
             await client2.post(
                 "https://api.hostinger.com/api/v1/mailboxes/" + HOSTINGER_MAILBOX + "/folders/INBOX/messages/" + urllib.parse.quote(uid) + "/move",
@@ -409,10 +408,7 @@ async def revisar_correo_logic(env: dict):
     if not isinstance(messages, list) or not messages:
         return []
 
-    all_sol = await query_all(DB_SOL, env, {})
-    all_res = await query_all(DB_RES, env, {})
     actions = []
-
     for msg in messages:
         uid = str(msg.get("uid") or msg.get("id") or "")
         if not uid:
@@ -456,11 +452,10 @@ async def revisar_correo_logic(env: dict):
             }
         })
 
-        # Mover correo a INBOX.Aceptadas para que no se vuelva a leer
+        # Mover correo a INBOX.Aceptadas de forma segura para evitar duplicados
         try:
-            import urllib.parse
             await hostinger_move(env, uid)
-        except Exception as e:
+        except Exception:
             pass
 
         mensaje = (
@@ -525,7 +520,6 @@ class ActionRequest(BaseModel):
 
 @app.post("/api/sesion-realizada")
 async def api_sesion_realizada(body: ActionRequest):
-    # Lógica de marcar realizada y pago recibido
     reservation = await notion("pages/" + body.reservationId, ENV_CONFIG)
     p = reservation.get("properties", {})
     
