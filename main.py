@@ -611,11 +611,44 @@ async def api_sesion_realizada(body: ActionRequest):
     await notion_update_page(body.reservationId, ENV_CONFIG, {"Pago": {"select": {"name": "RECIBIDO"}}})
     return {"ok": True, "alreadyExists": False}
 
-async function suspenderReserva(reservationId){
-  if(!reservationId){alert("No se ha encontrado el ID.");return;}
-  targetIdToProcess = reservationId;
-  document.getElementById("modalSuspender").style.display = "flex";
-}
+@app.post("/api/suspender-reserva")
+async def api_suspender_reserva(body: ActionRequest):
+    if not body.reservationId:
+        raise HTTPException(status_code=400, detail="Falta el ID de la reserva.")
+        
+    reservation = await notion("pages/" + body.reservationId, ENV_CONFIG)
+    p = reservation.get("properties", {})
+    
+    props = {
+        "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Reserva suspendida"}}]},
+        "Fecha": {"date": {"start": date_prop(p.get("Fecha"))}},
+        "Hora": {"date": {"start": hora(p.get("Hora"))}},
+        "Jugadores": {"number": num(p.get("Jugadores"))},
+        "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}}
+    }
+    
+    tel = phone(p.get("Teléfono"))
+    if tel:
+        props["Teléfono"] = {"phone_number": tel}
+
+    if body.motivo:
+        props["Motivo"] = {"select": {"name": body.motivo}}
+    if body.senal:
+        props["Señal"] = {"select": {"name": body.senal}}
+    
+    props["Tipo"] = {"select": {"name": "SUSPENDIDA"}}
+
+    await notion("pages", ENV_CONFIG, {
+        "parent": {"database_id": DB_NO_REALIZADAS},
+        "properties": props
+    })
+    
+    try:
+        await notion_archive_page(body.reservationId, ENV_CONFIG)
+    except Exception:
+        await notion_update_page(body.reservationId, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
+
+    return {"ok": True}
 
 @app.post("/api/confirmar-solicitud")
 async def api_confirmar_solicitud(body: ActionRequest):
@@ -654,20 +687,23 @@ async def api_rechazar_solicitud(body: ActionRequest):
         "Fecha": {"date": {"start": date_prop(p.get("Fecha"))}},
         "Hora": {"date": {"start": hora(p.get("Hora"))}},
         "Jugadores": {"number": num(p.get("Jugadores"))},
-        "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}},
-        "Teléfono": {"phone_number": phone(p.get("Teléfono"))} if phone(p.get("Teléfono")) else {"phone_number": None}
+        "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}}
     }
+    
+    tel = phone(p.get("Teléfono"))
+    if tel:
+        props["Teléfono"] = {"phone_number": tel}
+
     if body.motivo:
         props["Motivo"] = {"select": {"name": body.motivo}}
-    try:
-        props["Tipo"] = {"select": {"name": "RECHAZADA"}}
-    except Exception:
-        pass
+    
+    props["Tipo"] = {"select": {"name": "RECHAZADA"}}
 
     await notion("pages", ENV_CONFIG, {
         "parent": {"database_id": DB_NO_REALIZADAS},
         "properties": props
     })
+    
     try:
         await notion_archive_page(body.requestId, ENV_CONFIG)
     except Exception:
@@ -902,10 +938,11 @@ document.getElementById("modalRechazar").style.display = "flex";
 async function ejecutarRechazo(){
 if(!targetIdToProcess) return;
 const motivo = document.getElementById("selectMotivoRech").value;
+const idToSend = targetIdToProcess;
 cerrarModales();
 
 try{
-const r=await fetch("/api/rechazar-solicitud",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({requestId: targetIdToProcess, motivo: motivo})});
+const r=await fetch("/api/rechazar-solicitud",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({requestId: idToSend, motivo: motivo})});
 const data=await r.json();
 if(!r.ok||!data.ok)throw new Error(data.error||"No se pudo rechazar");
 alert("✅ Solicitud rechazada y movida al histórico.");
@@ -922,10 +959,11 @@ async function ejecutarSuspension(){
 if(!targetIdToProcess) return;
 const motivo = document.getElementById("selectMotivoSusp").value;
 const senal = document.getElementById("selectSenal").value;
+const idToSend = targetIdToProcess;
 cerrarModales();
 
 try{
-const r=await fetch("/api/suspender-reserva",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({reservationId: targetIdToProcess, motivo: motivo, senal: senal})});
+const r=await fetch("/api/suspender-reserva",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({reservationId: idToSend, motivo: motivo, senal: senal})});
 const data=await r.json();
 if(!r.ok||!data.ok)throw new Error(data.error||"No se pudo suspender la reserva");
 alert("✅ Reserva suspendida y movida al histórico.");
