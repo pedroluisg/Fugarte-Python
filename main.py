@@ -613,6 +613,9 @@ async def api_sesion_realizada(body: ActionRequest):
 
 @app.post("/api/suspender-reserva")
 async def api_suspender_reserva(body: ActionRequest):
+    if not body.reservationId:
+        raise HTTPException(status_code=400, detail="Falta el ID de la reserva a suspender.")
+        
     reservation = await notion("pages/" + body.reservationId, ENV_CONFIG)
     p = reservation.get("properties", {})
     
@@ -638,7 +641,6 @@ async def api_suspender_reserva(body: ActionRequest):
         "properties": props
     })
     
-    # Archivar / eliminar de reservas confirmadas activas
     try:
         await notion_archive_page(body.reservationId, ENV_CONFIG)
     except Exception:
