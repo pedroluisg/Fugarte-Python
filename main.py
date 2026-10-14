@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 # Cargar las variables del archivo .env
 load_dotenv()
 
+
 app = FastAPI()
 
 ENV_CONFIG = {
