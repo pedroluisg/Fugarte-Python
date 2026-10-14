@@ -612,11 +612,20 @@ async def api_sesion_realizada(body: ActionRequest):
     return {"ok": True, "alreadyExists": False}
 
 @app.post("/api/suspender-reserva")
-async def api_suspender_reserva(body: ActionRequest):
-    if not body.reservationId:
+async def api_suspender_reserva(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Cuerpo JSON inválido.")
+
+    reservation_id = body.get("reservationId")
+    motivo = body.get("motivo")
+    senal = body.get("senal")
+
+    if not reservation_id:
         raise HTTPException(status_code=400, detail="Falta el ID de la reserva.")
         
-    reservation = await notion("pages/" + body.reservationId, ENV_CONFIG)
+    reservation = await notion("pages/" + reservation_id, ENV_CONFIG)
     p = reservation.get("properties", {})
     
     props = {
@@ -631,10 +640,10 @@ async def api_suspender_reserva(body: ActionRequest):
     if tel:
         props["Teléfono"] = {"phone_number": tel}
 
-    if body.motivo:
-        props["Motivo"] = {"select": {"name": body.motivo}}
-    if body.senal:
-        props["Señal"] = {"select": {"name": body.senal}}
+    if motivo:
+        props["Motivo"] = {"select": {"name": motivo}}
+    if senal:
+        props["Señal"] = {"select": {"name": senal}}
     
     props["Tipo"] = {"select": {"name": "SUSPENDIDA"}}
 
@@ -644,9 +653,9 @@ async def api_suspender_reserva(body: ActionRequest):
     })
     
     try:
-        await notion_archive_page(body.reservationId, ENV_CONFIG)
+        await notion_archive_page(reservation_id, ENV_CONFIG)
     except Exception:
-        await notion_update_page(body.reservationId, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
+        await notion_update_page(reservation_id, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
 
     return {"ok": True}
 
