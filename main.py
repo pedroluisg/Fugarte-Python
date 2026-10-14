@@ -22,6 +22,7 @@ ENV_CONFIG = {
 DB_SOL = "53f757ce-a190-4eea-9cf5-d03b107f04e6"
 DB_RES = "f0129517-1439-40e7-8130-931bfb1278ea"
 DB_SES = "7dc65dcfd88c4da2b8a1c5fa1ef8e777"
+DB_NO_REALIZADAS = "e694fcc30a19483fb5fc068cfa91ee87"
 
 HOSTINGER_MAILBOX = "AC76aebfc4d60a270d918b4549d4cd"
 
@@ -282,6 +283,22 @@ async def sesiones_realizadas(env: dict):
     return res
 
 
+async def no_realizadas(env: dict):
+    data = await query_all(DB_NO_REALIZADAS, env, {"sorts": [{"property": "Fecha", "direction": "descending"}, {"property": "Hora", "direction": "descending"}]})
+    res = []
+    for x in data:
+        p = x.get("properties", {})
+        fecha = date_prop(p.get("Fecha"))
+        hora_valor = hora(p.get("Hora"))
+        res.append({
+            "id": x["id"], "nombre": prop(p.get("Nombre")), "fecha": fecha,
+            "fechaTexto": fmt_date(fecha), "hora": hora_valor, "horaTexto": fmt_time(hora_valor),
+            "jugadores": num(p.get("Jugadores")), "version": prop(p.get("Versión")),
+            "tipo": prop(p.get("Tipo")), "motivo": prop(p.get("Motivo")), "senal": prop(p.get("Señal"))
+        })
+    return res
+
+
 # =========================================================
 # HOSTINGER API & EXTRACCIÓN INTELIGENTE DE CORREOS
 # =========================================================
@@ -377,7 +394,7 @@ def resolver_hora_flexible(text: str, after: str, before: str) -> str:
     texto_lower = text.lower()
     es_tarde = any(w in texto_lower for w in ["tarde", "noches", "vesprada", "pm", "17:", "18:", "19:", "20:", "21:"])
     
-    objetivo_minutos = 18 * 60 + 30 if es_tarde else 12 * 60  # 18:30 o 12:00
+    objetivo_minutos = 18 * 60 + 30 if es_tarde else 12 * 60
     
     min_m = minutes_of(after) if after else (16 * 60 if es_tarde else 9 * 60)
     max_m = minutes_of(before) if before else (22 * 60 if es_tarde else 15 * 60)
@@ -559,9 +576,15 @@ async def api_reservas():
 async def api_sesiones():
     return await sesiones_realizadas(ENV_CONFIG)
 
+@app.get("/api/no-realizadas")
+async def api_no_realizadas():
+    return await no_realizadas(ENV_CONFIG)
+
 class ActionRequest(BaseModel):
     reservationId: Optional[str] = None
     requestId: Optional[str] = None
+    motivo: Optional[str] = None
+    senal: Optional[str] = None
 
 @app.post("/api/sesion-realizada")
 async def api_sesion_realizada(body: ActionRequest):
@@ -584,6 +607,29 @@ async def api_sesion_realizada(body: ActionRequest):
     })
     await notion_update_page(body.reservationId, ENV_CONFIG, {"Pago": {"select": {"name": "RECIBIDO"}}})
     return {"ok": True, "alreadyExists": False}
+
+@app.post("/api/suspender-reserva")
+async def api_suspender_reserva(body: ActionRequest):
+    reservation = await notion("pages/" + body.reservationId, ENV_CONFIG)
+    p = reservation.get("properties", {})
+    
+    await notion("pages", ENV_CONFIG, {
+        "parent": {"database_id": DB_NO_REALIZADAS},
+        "properties": {
+            "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Reserva suspendida"}}]},
+            "Fecha": {"date": {"start": date_prop(p.get("Fecha"))}},
+            "Hora": {"date": {"start": hora(p.get("Hora"))}},
+            "Jugadores": {"number": num(p.get("Jugadores"))},
+            "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}},
+            "Tipo": {"select": {"name": "SUSPENDIDA"}},
+            "Motivo": {"select": {"name": body.motivo or "Suspende cliente"}},
+            "Señal": {"select": {"name": body.senal or "N/A"}},
+            "Teléfono": {"phone_number": phone(p.get("Teléfono"))} if phone(p.get("Teléfono")) else {"phone_number": None}
+        }
+    })
+    # Cambiar estado en DB_RES a CANCELADA o archivar/actualizar
+    await notion_update_page(body.reservationId, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
+    return {"ok": True}
 
 @app.post("/api/confirmar-solicitud")
 async def api_confirmar_solicitud(body: ActionRequest):
@@ -614,6 +660,23 @@ async def api_confirmar_solicitud(body: ActionRequest):
 
 @app.post("/api/rechazar-solicitud")
 async def api_rechazar_solicitud(body: ActionRequest):
+    r = await notion("pages/" + body.requestId, ENV_CONFIG)
+    p = r.get("properties", {})
+    
+    await notion("pages", ENV_CONFIG, {
+        "parent": {"database_id": DB_NO_REALIZADAS},
+        "properties": {
+            "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Solicitud rechazada"}}]},
+            "Fecha": {"date": {"start": date_prop(p.get("Fecha"))}},
+            "Hora": {"date": {"start": hora(p.get("Hora"))}},
+            "Jugadores": {"number": num(p.get("Jugadores"))},
+            "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}},
+            "Tipo": {"select": {"name": "RECHAZADA"}},
+            "Motivo": {"select": {"name": body.motivo or "Rechazada por el cliente"}},
+            "Señal": {"select": {"name": "N/A"}},
+            "Teléfono": {"phone_number": phone(p.get("Teléfono"))} if phone(p.get("Teléfono")) else {"phone_number": None}
+        }
+    })
     await notion_update_page(body.requestId, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
     return {"ok": True}
 
@@ -624,7 +687,7 @@ async def api_revisar_correo():
 
 
 # =========================================================
-# HTML FRONTEND (INTERFAZ ORIGINAL COMPLETA + DESPLEGABLE SESIONES)
+# HTML FRONTEND (INTERFAZ COMPLETA + SUSPENSIONES Y RECHAZOS)
 # =========================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -650,6 +713,7 @@ button,.wa{display:block;width:100%;padding:13px;border:0;border-radius:10px;bac
 .refresh{background:#2563eb}
 .mail{background:#7c3aed}
 .action{background:#dc2626}
+.suspend{background:#d97706}
 .small{font-size:13px;color:#666}
 .empty{text-align:center;color:#666;padding:20px}
 .badge{display:inline-block;padding:4px 8px;border-radius:8px;background:#eee;margin-top:5px;font-size:13px}
@@ -684,6 +748,10 @@ Revisa INBOX, comprueba Notion y disponibilidad, crea la solicitud y se detiene 
 <div class="title">📚 Sesiones realizadas</div>
 <div id="ses">Cargando...</div>
 </div>
+<div class="card">
+<div class="title">🚫 Histórico No Realizadas (Suspendidas / Rechazadas)</div>
+<div id="no-realizadas">Cargando...</div>
+</div>
 <button class="refresh" onclick="cargar()">🔄 Actualizar</button>
 </main>
 <script>
@@ -692,16 +760,16 @@ if(value===null||value===undefined||value===""){return fallback||"";}
 return String(value);
 }
 
-let globalSesiones = [];
-
 async function cargar(){
 const sol=document.getElementById("sol");
 const res=document.getElementById("res");
 const ses=document.getElementById("ses");
+const noRealizadas=document.getElementById("no-realizadas");
 const next=document.getElementById("next");
 sol.innerHTML="Cargando...";
 res.innerHTML="Cargando...";
 ses.innerHTML="Cargando...";
+noRealizadas.innerHTML="Cargando...";
 next.innerHTML="";
 
 async function leerArray(url, nombre){
@@ -718,20 +786,21 @@ throw new Error(nombre+" devolvió un formato inesperado");
 const resultados=await Promise.allSettled([
 leerArray("/api/solicitudes", "Solicitudes"),
 leerArray("/api/reservas", "Reservas"),
-leerArray("/api/sesiones", "Sesiones")
+leerArray("/api/sesiones", "Sesiones"),
+leerArray("/api/no-realizadas", "No Realizadas")
 ]);
 
 if(resultados[0].status==="fulfilled"){mostrarSolicitudes(resultados[0].value);}
-else{sol.innerHTML='<div class="error">❌ Error al cargar las solicitudes: '+safe(resultados[0].reason?.message,"error")+'</div>';}
+else{sol.innerHTML='<div class="error">❌ Error al cargar solicitudes: '+safe(resultados[0].reason?.message,"error")+'</div>';}
 
 if(resultados[1].status==="fulfilled"){mostrarReservas(resultados[1].value);}
-else{res.innerHTML='<div class="error">❌ Error al cargar las reservas: '+safe(resultados[1].reason?.message,"error")+'</div>';}
+else{res.innerHTML='<div class="error">❌ Error al cargar reservas: '+safe(resultados[1].reason?.message,"error")+'</div>';}
 
-if(resultados[2].status==="fulfilled"){
-globalSesiones = resultados[2].value;
-mostrarSesionesDesplegable(globalSesiones);
-}
-else{ses.innerHTML='<div class="error">❌ Error al cargar las sesiones: '+safe(resultados[2].reason?.message,"error")+'</div>';}
+if(resultados[2].status==="fulfilled"){mostrarSesionesDesplegable(resultados[2].value, "ses");}
+else{ses.innerHTML='<div class="error">❌ Error al cargar sesiones: '+safe(resultados[2].reason?.message,"error")+'</div>';}
+
+if(resultados[3].status==="fulfilled"){mostrarSesionesDesplegable(resultados[3].value, "no-realizadas");}
+else{noRealizadas.innerHTML='<div class="error">❌ Error al cargar histórico: '+safe(resultados[3].reason?.message,"error")+'</div>';}
 }
 
 async function revisarCorreo(){
@@ -771,7 +840,7 @@ review.innerHTML='<div class="card error">'+safe(e.message)+'</div>';
 
 async function confirmarSolicitud(requestId){
 if(!requestId){alert("No se ha encontrado el ID de la solicitud.");return;}
-if(!confirm("¿Confirmar esta reserva?\\n\\nSe creará en Reservas Fugarte como CONFIRMADA."))return;
+if(!confirm("¿Confirmar esta reserva?\n\nSe creará en Reservas Fugarte como CONFIRMADA."))return;
 try{
 const r=await fetch("/api/confirmar-solicitud",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({requestId})});
 const data=await r.json();
@@ -783,12 +852,36 @@ await cargar();
 
 async function rechazarSolicitud(requestId){
 if(!requestId){alert("No se ha encontrado el ID.");return;}
-if(!confirm("¿Seguro que quieres rechazar esta solicitud?"))return;
+const motivo = prompt("¿Quién rechaza esta solicitud?\n\nEscribe 1 para: Rechazada por el cliente\nEscribe 2 para: Rechazada por nosotros", "1");
+if(!motivo) return;
+const motivoTexto = (motivo.trim() === "2") ? "Rechazada por nosotros" : "Rechazada por el cliente";
+
 try{
-const r=await fetch("/api/rechazar-solicitud",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({requestId})});
+const r=await fetch("/api/rechazar-solicitud",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({requestId, motivo: motivoTexto})});
 const data=await r.json();
 if(!r.ok||!data.ok)throw new Error(data.error||"No se pudo rechazar");
-alert("✅ Solicitud cancelada.");
+alert("✅ Solicitud rechazada y movida al histórico.");
+await cargar();
+}catch(e){alert("❌ "+e.message);}
+}
+
+async function suspenderReserva(reservationId){
+if(!reservationId){alert("No se ha encontrado el ID.");return;}
+const motivo = prompt("¿Motivo de la suspensión?\n\nEscribe 1 para: Suspende cliente\nEscribe 2 para: Suspendemos nosotros", "1");
+if(!motivo) return;
+const motivoTexto = (motivo.trim() === "2") ? "Suspendemos nosotros" : "Suspende cliente";
+
+const senal = prompt("¿Qué ocurre con la señal de 10 €?\n\nEscribe 1 para: Devuelta\nEscribe 2 para: No devuelta\nEscribe 3 para: N/A", "1");
+if(!senal) return;
+let senalTexto = "Devuelta";
+if(senal.trim() === "2") senalTexto = "No devuelta";
+else if(senal.trim() === "3") senalTexto = "N/A";
+
+try{
+const r=await fetch("/api/suspender-reserva",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({reservationId, motivo: motivoTexto, senal: senalTexto})});
+const data=await r.json();
+if(!r.ok||!data.ok)throw new Error(data.error||"No se pudo suspender la reserva");
+alert("✅ Reserva suspendida y movida al histórico.");
 await cargar();
 }catch(e){alert("❌ "+e.message);}
 }
@@ -812,8 +905,8 @@ output+='<div class="card">';
 output+="<strong>"+safe(x.nombre,"Sin nombre")+"</strong>";
 output+='<div class="info">📅 '+safe(x.fechaTexto,"Sin fecha")+"<br>🕐 "+safe(x.horaTexto,"Sin hora")+"<br>👥 "+safe(x.jugadores,"Sin dato")+" personas<br>🎯 "+safe(x.version,"Sin versión")+"</div>";
 if(x.whatsapp){output+='<a class="wa" href="'+x.whatsapp+'" target="_blank" rel="noopener">💬 Abrir WhatsApp</a>';}
-output+='<button class="action" onclick="confirmarSolicitud(\\''+x.id+'\\')">✅ CONFIRMAR RESERVA</button>';
-output+='<button class="action" onclick="rechazarSolicitud(\\''+x.id+'\\')">❌ RECHAZAR SOLICITUD</button>';
+output+='<button class="action" onclick="confirmarSolicitud(\x27'+x.id+'\x27)">✅ CONFIRMAR RESERVA</button>';
+output+='<button class="action" onclick="rechazarSolicitud(\x27'+x.id+'\x27)">❌ RECHAZAR SOLICITUD</button>';
 output+="</div>";
 });
 document.getElementById("sol").innerHTML=output;
@@ -830,16 +923,16 @@ a.forEach(function(x,i){
 output+='<div class="card"><strong>'+safe(x.nombre,"Sin nombre")+"</strong>";
 if(i===0){output+='<div class="badge">⭐ Próxima</div>';}
 output+='<div class="info">📅 '+safe(x.fechaTexto)+"<br>🕐 "+safe(x.horaTexto)+"<br>👥 "+safe(x.jugadores)+" personas<br>🎯 "+safe(x.version)+"</div>";
-output+='<button class="action" onclick="marcarSesionRealizada(\\''+x.id+'\\')">✅ SESIÓN REALIZADA + PAGO RECIBIDO</button>';
+output+='<button class="action" onclick="marcarSesionRealizada(\x27'+x.id+'\x27)">✅ SESIÓN REALIZADA + PAGO RECIBIDO</button>';
+output+='<button class="suspend" onclick="suspenderReserva(\x27'+x.id+'\x27)">⚠️ SUSPENDER / CANCELAR RESERVA</button>';
 output+="</div>";
 });
 document.getElementById("res").innerHTML=output;
 }
 
-function mostrarSesionesDesplegable(a){
-if(!Array.isArray(a)||!a.length){document.getElementById("ses").innerHTML='<div class="empty">Todavía no hay sesiones.</div>';return;}
+function mostrarSesionesDesplegable(a, containerId){
+if(!Array.isArray(a)||!a.length){document.getElementById(containerId).innerHTML='<div class="empty">No hay registros.</div>';return;}
 
-// Agrupar por año y mes
 const arbol = {};
 const mesesNombres = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
 
@@ -860,22 +953,26 @@ const aniosOrdenados = Object.keys(arbol).sort().reverse();
 let output = "";
 
 aniosOrdenados.forEach(function(anio){
-output += `<button class="dropdown-btn" onclick="toggleAnio('${anio}')">📁 Año ${anio} ▾</button>`;
-output += `<div id="anio-${anio}" class="dropdown-content">`;
+output += `<button class="dropdown-btn" onclick="toggleAnio('${containerId}', '${anio}')">📁 Año ${anio} ▾</button>`;
+output += `<div id="anio-${containerId}-${anio}" class="dropdown-content">`;
 
 const mesesOrdenados = Object.keys(arbol[anio]).sort(function(m1, m2){
 return mesesNombres.indexOf(m2) - mesesNombres.indexOf(m1);
 });
 
 mesesOrdenados.forEach(function(mes){
-output += `<button class="dropdown-btn" onclick="toggleMes('${anio}', '${mes}')" style="background:#6b7280; font-size:15px;">📂 ${mes} ▾</button>`;
-output += `<div id="mes-${anio}-${mes}" class="dropdown-content">`;
+output += `<button class="dropdown-btn" onclick="toggleMes('${containerId}', '${anio}', '${mes}')" style="background:#6b7280; font-size:15px;">📂 ${mes} ▾</button>`;
+output += `<div id="mes-${containerId}-${anio}-${mes}" class="dropdown-content">`;
 
 arbol[anio][mes].forEach(function(x){
 output += `<div class="card" style="margin-top:8px; margin-bottom:8px; background:#f9fafb;">`;
 output += `<strong>${safe(x.nombre,"Sin nombre")}</strong>`;
-output += `<div class="info">📅 ${safe(x.fechaTexto)}<br>🕐 ${safe(x.horaTexto)}<br>👥 ${safe(x.jugadores)} personas<br>🎯 ${safe(x.version)}<br>💶 Pago: ${safe(x.pago,"RECIBIDO")}</div>`;
-output += `</div>`;
+output += `<div class="info">📅 ${safe(x.fechaTexto)}<br>🕐 ${safe(x.horaTexto)}<br>👥 ${safe(x.jugadores)} personas<br>🎯 ${safe(x.version)}`;
+if(x.tipo) output += `<br>📌 Tipo: ${safe(x.tipo)}`;
+if(x.motivo) output += `<br>ℹ️ Motivo: ${safe(x.motivo)}`;
+if(x.senal) output += `<br>💶 Señal: ${safe(x.senal)}`;
+if(x.pago) output += `<br>💶 Pago: ${safe(x.pago)}`;
+output += `</div></div>`;
 });
 
 output += `</div>`;
@@ -884,16 +981,16 @@ output += `</div>`;
 output += `</div>`;
 });
 
-document.getElementById("ses").innerHTML = output || '<div class="empty">Todavía no hay sesiones.</div>';
+document.getElementById(containerId).innerHTML = output || '<div class="empty">No hay registros.</div>';
 }
 
-function toggleAnio(anio){
-const el = document.getElementById("anio-" + anio);
+function toggleAnio(containerId, anio){
+const el = document.getElementById("anio-" + containerId + "-" + anio);
 if(el){ el.style.display = (el.style.display === "block") ? "none" : "block"; }
 }
 
-function toggleMes(anio, mes){
-const el = document.getElementById("mes-" + anio + "-" + mes);
+function toggleMes(containerId, anio, mes){
+const el = document.getElementById("mes-" + containerId + "-" + anio + "-" + mes);
 if(el){ el.style.display = (el.style.display === "block") ? "none" : "block"; }
 }
 
