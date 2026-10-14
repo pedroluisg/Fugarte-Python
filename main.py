@@ -627,10 +627,23 @@ async def api_suspender_reserva(request: Request):
         reservation = await notion("pages/" + reservation_id, ENV_CONFIG, method="GET")
         p = reservation.get("properties", {})
         
+        fecha_val = date_prop(p.get("Fecha"))
+        h_val = hora(p.get("Hora"))
+        
+        # Construir formato ISO válido combinando fecha y hora para Notion
+        hora_iso = None
+        if fecha_val:
+            t_str = h_val if (h_val and len(h_val) == 5) else "10:00"
+            try:
+                dt_base = datetime.fromisoformat(fecha_val + "T" + t_str + ":00").replace(tzinfo=TZ)
+                hora_iso = dt_base.astimezone(zoneinfo.ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+            except Exception:
+                hora_iso = fecha_val + "T10:00:00Z"
+
         props = {
             "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Reserva suspendida"}}]},
-            "Fecha": {"date": {"start": date_prop(p.get("Fecha"))}},
-            "Hora": {"date": {"start": hora(p.get("Hora"))}},
+            "Fecha": {"date": {"start": fecha_val}} if fecha_val else {"date": None},
+            "Hora": {"date": {"start": hora_iso}} if hora_iso else {"date": None},
             "Jugadores": {"number": num(p.get("Jugadores"))},
             "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}}
         }
@@ -646,13 +659,13 @@ async def api_suspender_reserva(request: Request):
         
         props["Tipo"] = {"select": {"name": "SUSPENDIDA"}}
 
-        # 2. Crear el registro en el histórico de no realizadas
+        # 2. Crear el registro en el histórico
         await notion("pages", ENV_CONFIG, {
             "parent": {"database_id": DB_NO_REALIZADAS},
             "properties": props
         }, method="POST")
         
-        # 3. Archivar o cancelar la reserva original para que desaparezca de activas
+        # 3. Archivar o cancelar la reserva original
         try:
             await notion_archive_page(reservation_id, ENV_CONFIG)
         except Exception:
@@ -662,6 +675,65 @@ async def api_suspender_reserva(request: Request):
         
     except Exception as e:
         print("ERROR EN SUSPENSIÓN:", str(e))
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+
+
+@app.post("/api/rechazar-solicitud")
+async def api_rechazar_solicitud(request: Request):
+    try:
+        body = await request.json()
+        request_id = body.get("requestId")
+        motivo = body.get("motivo")
+
+        if not request_id:
+            raise HTTPException(status_code=400, detail="Falta el ID de la solicitud.")
+
+        r = await notion("pages/" + request_id, ENV_CONFIG, method="GET")
+        p = r.get("properties", {})
+        
+        fecha_val = date_prop(p.get("Fecha"))
+        h_val = hora(p.get("Hora"))
+        
+        hora_iso = None
+        if fecha_val:
+            t_str = h_val if (h_val and len(h_val) == 5) else "10:00"
+            try:
+                dt_base = datetime.fromisoformat(fecha_val + "T" + t_str + ":00").replace(tzinfo=TZ)
+                hora_iso = dt_base.astimezone(zoneinfo.ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+            except Exception:
+                hora_iso = fecha_val + "T10:00:00Z"
+        
+        props = {
+            "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Solicitud rechazada"}}]},
+            "Fecha": {"date": {"start": fecha_val}} if fecha_val else {"date": None},
+            "Hora": {"date": {"start": hora_iso}} if hora_iso else {"date": None},
+            "Jugadores": {"number": num(p.get("Jugadores"))},
+            "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}}
+        }
+        
+        tel = phone(p.get("Teléfono"))
+        if tel:
+            props["Teléfono"] = {"phone_number": tel}
+
+        if motivo:
+            props["Motivo"] = {"select": {"name": motivo}}
+        
+        props["Tipo"] = {"select": {"name": "RECHAZADA"}}
+
+        await notion("pages", ENV_CONFIG, {
+            "parent": {"database_id": DB_NO_REALIZADAS},
+            "properties": props
+        }, method="POST")
+
+        try:
+            await notion_archive_page(request_id, ENV_CONFIG)
+        except Exception:
+            await notion_update_page(request_id, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
+
+        return {"ok": True}
+        
+    except Exception as e:
+        print("ERROR EN RECHAZO:", str(e))
         return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
 
 @app.post("/api/confirmar-solicitud")
@@ -690,40 +762,6 @@ async def api_confirmar_solicitud(body: ActionRequest):
     })
     await notion_update_page(body.requestId, ENV_CONFIG, {"Estado": {"select": {"name": "CONFIRMADA"}}})
     return {"ok": True, "nombre": prop(p.get("Nombre")), "fecha": fecha, "hora": h_val}
-
-@app.post("/api/rechazar-solicitud")
-async def api_rechazar_solicitud(body: ActionRequest):
-    r = await notion("pages/" + body.requestId, ENV_CONFIG, method="GET")
-    p = r.get("properties", {})
-    
-    props = {
-        "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Solicitud rechazada"}}]},
-        "Fecha": {"date": {"start": date_prop(p.get("Fecha"))}},
-        "Hora": {"date": {"start": hora(p.get("Hora"))}},
-        "Jugadores": {"number": num(p.get("Jugadores"))},
-        "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}}
-    }
-    
-    tel = phone(p.get("Teléfono"))
-    if tel:
-        props["Teléfono"] = {"phone_number": tel}
-
-    if body.motivo:
-        props["Motivo"] = {"select": {"name": body.motivo}}
-    
-    props["Tipo"] = {"select": {"name": "RECHAZADA"}}
-
-    await notion("pages", ENV_CONFIG, {
-        "parent": {"database_id": DB_NO_REALIZADAS},
-        "properties": props
-    })
-    
-    try:
-        await notion_archive_page(body.requestId, ENV_CONFIG)
-    except Exception:
-        await notion_update_page(body.requestId, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
-
-    return {"ok": True}
 
 @app.post("/api/revisar-correo")
 async def api_revisar_correo():
