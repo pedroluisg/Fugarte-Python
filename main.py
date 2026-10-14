@@ -611,55 +611,11 @@ async def api_sesion_realizada(body: ActionRequest):
     await notion_update_page(body.reservationId, ENV_CONFIG, {"Pago": {"select": {"name": "RECIBIDO"}}})
     return {"ok": True, "alreadyExists": False}
 
-@app.post("/api/suspender-reserva")
-async def api_suspender_reserva(body: ActionRequest):
-    if not body.reservationId:
-        raise HTTPException(status_code=400, detail="Falta el ID de la reserva a suspender.")
-        
-    reservation = await notion("pages/" + body.reservationId, ENV_CONFIG)
-    p = reservation.get("properties", {})
-    
-    # Propiedades básicas obligatorias para evitar fallos de formato en Notion
-    props = {
-        "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Reserva suspendida"}}]},
-        "Fecha": {"date": {"start": date_prop(p.get("Fecha"))}},
-        "Hora": {"date": {"start": hora(p.get("Hora"))}},
-        "Jugadores": {"number": num(p.get("Jugadores"))},
-        "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}},
-        "Teléfono": {"phone_number": phone(p.get("Teléfono"))} if phone(p.get("Teléfono")) else {"phone_number": None}
-    }
-
-    # Intentar añadir los selectores opcionales de manera segura
-    if body.motivo:
-        try:
-            props["Motivo"] = {"select": {"name": body.motivo}}
-        except Exception:
-            pass
-            
-    if body.senal:
-        try:
-            props["Señal"] = {"select": {"name": body.senal}}
-        except Exception:
-            pass
-            
-    try:
-        props["Tipo"] = {"select": {"name": "SUSPENDIDA"}}
-    except Exception:
-        pass
-
-    # Crear la página en la nueva base de datos
-    await notion("pages", ENV_CONFIG, {
-        "parent": {"database_id": DB_NO_REALIZADAS},
-        "properties": props
-    })
-    
-    # Archivar la reserva original para que desaparezca de confirmadas activas
-    try:
-        await notion_archive_page(body.reservationId, ENV_CONFIG)
-    except Exception:
-        await notion_update_page(body.reservationId, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
-
-    return {"ok": True}
+async function suspenderReserva(reservationId){
+  if(!reservationId){alert("No se ha encontrado el ID.");return;}
+  targetIdToProcess = reservationId;
+  document.getElementById("modalSuspender").style.display = "flex";
+}
 
 @app.post("/api/confirmar-solicitud")
 async def api_confirmar_solicitud(body: ActionRequest):
