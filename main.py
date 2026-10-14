@@ -616,49 +616,53 @@ async def api_sesion_realizada(body: ActionRequest):
 async def api_suspender_reserva(request: Request):
     try:
         body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Cuerpo JSON inválido.")
+        reservation_id = body.get("reservationId")
+        motivo = body.get("motivo")
+        senal = body.get("senal")
 
-    reservation_id = body.get("reservationId")
-    motivo = body.get("motivo")
-    senal = body.get("senal")
-
-    if not reservation_id:
-        raise HTTPException(status_code=400, detail="Falta el ID de la reserva.")
+        if not reservation_id:
+            raise HTTPException(status_code=400, detail="Falta el ID de la reserva a suspender.")
+            
+        # 1. Consultar la página existente usando method="GET"
+        reservation = await notion("pages/" + reservation_id, ENV_CONFIG, method="GET")
+        p = reservation.get("properties", {})
         
-    reservation = await notion("pages/" + body.reservationId, ENV_CONFIG, method="GET")
-    p = reservation.get("properties", {})
-    
-    props = {
-        "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Reserva suspendida"}}]},
-        "Fecha": {"date": {"start": date_prop(p.get("Fecha"))}},
-        "Hora": {"date": {"start": hora(p.get("Hora"))}},
-        "Jugadores": {"number": num(p.get("Jugadores"))},
-        "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}}
-    }
-    
-    tel = phone(p.get("Teléfono"))
-    if tel:
-        props["Teléfono"] = {"phone_number": tel}
+        props = {
+            "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Reserva suspendida"}}]},
+            "Fecha": {"date": {"start": date_prop(p.get("Fecha"))}},
+            "Hora": {"date": {"start": hora(p.get("Hora"))}},
+            "Jugadores": {"number": num(p.get("Jugadores"))},
+            "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}}
+        }
+        
+        tel = phone(p.get("Teléfono"))
+        if tel:
+            props["Teléfono"] = {"phone_number": tel}
 
-    if motivo:
-        props["Motivo"] = {"select": {"name": motivo}}
-    if senal:
-        props["Señal"] = {"select": {"name": senal}}
-    
-    props["Tipo"] = {"select": {"name": "SUSPENDIDA"}}
+        if motivo:
+            props["Motivo"] = {"select": {"name": motivo}}
+        if senal:
+            props["Señal"] = {"select": {"name": senal}}
+        
+        props["Tipo"] = {"select": {"name": "SUSPENDIDA"}}
 
-    await notion("pages", ENV_CONFIG, {
-        "parent": {"database_id": DB_NO_REALIZADAS},
-        "properties": props
-    })
-    
-    try:
-        await notion_archive_page(reservation_id, ENV_CONFIG)
-    except Exception:
-        await notion_update_page(reservation_id, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
+        # 2. Crear el registro en el histórico de no realizadas
+        await notion("pages", ENV_CONFIG, {
+            "parent": {"database_id": DB_NO_REALIZADAS},
+            "properties": props
+        }, method="POST")
+        
+        # 3. Archivar o cancelar la reserva original para que desaparezca de activas
+        try:
+            await notion_archive_page(reservation_id, ENV_CONFIG)
+        except Exception:
+            await notion_update_page(reservation_id, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
 
-    return {"ok": True}
+        return {"ok": True}
+        
+    except Exception as e:
+        print("ERROR EN SUSPENSIÓN:", str(e))
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
 
 @app.post("/api/confirmar-solicitud")
 async def api_confirmar_solicitud(body: ActionRequest):
