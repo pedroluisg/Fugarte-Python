@@ -41,7 +41,9 @@ async def notion(url: str, env: dict, body: dict = None, method: str = "POST") -
         "Content-Type": "application/json"
     }
     async with httpx.AsyncClient() as client:
-        if method == "PATCH":
+        if method == "GET":
+            r = await client.get("https://api.notion.com/v1/" + url, headers=headers)
+        elif method == "PATCH":
             r = await client.patch("https://api.notion.com/v1/" + url, headers=headers, json=body or {})
         else:
             r = await client.post("https://api.notion.com/v1/" + url, headers=headers, json=body or {})
@@ -57,7 +59,6 @@ async def notion(url: str, env: dict, body: dict = None, method: str = "POST") -
             detail="Notion " + str(r.status_code) + " " + (data.get("message") or data.get("raw") or r.text or "Error desconocido")
         )
     return data
-
 
 async def query_all(database: str, env: dict, body: dict = None) -> list:
     results = []
