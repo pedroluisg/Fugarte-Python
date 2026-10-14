@@ -398,7 +398,9 @@ def minutes_of(time_str: str) -> Optional[int]:
 
 def resolver_hora_flexible(text: str, after: str, before: str) -> str:
     texto_lower = text.lower()
-    es_tarde = any(w in texto_lower for w in ["tarde", "noches", "vesprada", "pm", "17:", "18:", "19:", "20:", "21:"])
+    # Las horas típicas de tarde mencionadas sin especificar se consideran tarde (18:00+)
+    mencion_tarde = any(w in texto_lower for w in ["seis", "siete", "ocho", "nueve", "diez", "tarde", "noches", "vesprada", "pm", "17:", "18:", "19:", "20:", "21:", "18h", "19h", "20h"])
+    es_tarde = mencion_tarde and not "mañana" in texto_lower
     
     objetivo_minutos = 18 * 60 + 30 if es_tarde else 12 * 60
     
@@ -418,7 +420,6 @@ def resolver_hora_flexible(text: str, after: str, before: str) -> str:
                     mejor_slot = f"{str(h).zfill(2)}:{str(m).zfill(2)}"
                     
     return mejor_slot or ("18:30" if es_tarde else "12:00")
-
 
 def extract_players_from_mail(text: str) -> Optional[int]:
     patterns = [
@@ -491,7 +492,11 @@ async def revisar_correo_logic(env: dict):
         after = extract_after_from_mail(text)
         before = extract_before_from_mail(text)
         
-        if not hora_solicitada and (after or before or "tarde" in text.lower() or "mañana" in text.lower() or "10" in text or "11" in text or "17" in text):
+        # --- MEJORA 1: Detectar horas relativas ("seis", "siete", etc.) incluso si no ponen números ---
+        texto_lower = text.lower()
+        mencion_tarde = any(w in texto_lower for w in ["seis", "siete", "ocho", "nueve", "diez", "tarde", "noches", "vesprada", "pm", "17:", "18:", "19:", "20:", "21:", "18h", "19h", "20h"])
+        
+        if not hora_solicitada and (after or before or mencion_tarde or "mañana" in text.lower() or "10" in text or "11" in text or "17" in text):
             hora_solicitada = resolver_hora_flexible(text, after, before)
 
         jugadores = extract_players_from_mail(text)
@@ -501,6 +506,24 @@ async def revisar_correo_logic(env: dict):
 
         if not fecha or jugadores is None or not hora_solicitada:
             continue
+
+        # --- MEJORA 2: Validación Anti-Doble Booking ---
+        # Comprobamos si ya existe una reserva confirmada en esa misma fecha y hora exactas
+        reservas_existentes = await reservas(env)
+        ocupado = any(r.get("fecha") == fecha and r.get("hora") == hora_solicitada for r in reservas_existentes)
+
+        if ocupado:
+            actions.append({
+                "type": "CONFLICT",
+                "uid": uid,
+                "subject": subject,
+                "nombre": nombre,
+                "fecha": fecha,
+                "hora": hora_solicitada,
+                "reason": "⚠️ CONFLICTO CRÍTICO: El horario solicitado ya está ocupado por otra reserva confirmada. No se ha creado la solicitud para evitar duplicados."
+            })
+            break
+        # -----------------------------------------------
 
         dt_base = datetime.fromisoformat(fecha + "T" + hora_solicitada + ":00").replace(tzinfo=TZ)
         hora_utc = dt_base.astimezone(zoneinfo.ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
@@ -552,8 +575,6 @@ async def revisar_correo_logic(env: dict):
         break
 
     return actions
-
-
 # =========================================================
 # ACCIONES DE NOTION Y ENDPOINTS API
 # =========================================================
