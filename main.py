@@ -619,6 +619,7 @@ async def api_suspender_reserva(body: ActionRequest):
     reservation = await notion("pages/" + body.reservationId, ENV_CONFIG)
     p = reservation.get("properties", {})
     
+    # Propiedades básicas obligatorias para evitar fallos de formato en Notion
     props = {
         "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Reserva suspendida"}}]},
         "Fecha": {"date": {"start": date_prop(p.get("Fecha"))}},
@@ -627,20 +628,32 @@ async def api_suspender_reserva(body: ActionRequest):
         "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}},
         "Teléfono": {"phone_number": phone(p.get("Teléfono"))} if phone(p.get("Teléfono")) else {"phone_number": None}
     }
+
+    # Intentar añadir los selectores opcionales de manera segura
     if body.motivo:
-        props["Motivo"] = {"select": {"name": body.motivo}}
+        try:
+            props["Motivo"] = {"select": {"name": body.motivo}}
+        except Exception:
+            pass
+            
     if body.senal:
-        props["Señal"] = {"select": {"name": body.senal}}
+        try:
+            props["Señal"] = {"select": {"name": body.senal}}
+        except Exception:
+            pass
+            
     try:
         props["Tipo"] = {"select": {"name": "SUSPENDIDA"}}
     except Exception:
         pass
 
+    # Crear la página en la nueva base de datos
     await notion("pages", ENV_CONFIG, {
         "parent": {"database_id": DB_NO_REALIZADAS},
         "properties": props
     })
     
+    # Archivar la reserva original para que desaparezca de confirmadas activas
     try:
         await notion_archive_page(body.reservationId, ENV_CONFIG)
     except Exception:
