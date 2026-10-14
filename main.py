@@ -34,14 +34,17 @@ NV = "2022-06-28"
 # NOTION
 # =========================================================
 
-async def notion(url: str, env: dict, body: dict = None) -> dict:
+async def notion(url: str, env: dict, body: dict = None, method: str = "POST") -> dict:
     headers = {
         "Authorization": "Bearer " + env.get("NOTION_TOKEN", ""),
         "Notion-Version": NV,
         "Content-Type": "application/json"
     }
     async with httpx.AsyncClient() as client:
-        r = await client.post("https://api.notion.com/v1/" + url, headers=headers, json=body or {})
+        if method == "PATCH":
+            r = await client.patch("https://api.notion.com/v1/" + url, headers=headers, json=body or {})
+        else:
+            r = await client.post("https://api.notion.com/v1/" + url, headers=headers, json=body or {})
     
     try:
         data = r.json() if r.text else {}
@@ -332,7 +335,7 @@ async def hostinger_move(env: dict, uid: str) -> bool:
     if not (200 <= r.status_code < 300):
         async with httpx.AsyncClient() as client2:
             await client2.post(
-                "https://api.hostinger.com/api/v1/mailboxes/" + HOSTINGER_MAILBOX + "/folders/INBOX/messages/" + urllib.parse.quote(uid) + "/move",
+                "https://api.mail.hostinger.com/api/v1/mailboxes/" + HOSTINGER_MAILBOX + "/folders/INBOX/messages/" + urllib.parse.quote(uid) + "/move",
                 headers={"Authorization": "Bearer " + env.get("HOSTINGER_TOKEN", ""), "Content-Type": "application/json"},
                 json={"targetFolder": "INBOX.Aceptadas"}
             )
@@ -555,12 +558,10 @@ async def revisar_correo_logic(env: dict):
 # =========================================================
 
 async def notion_update_page(page_id: str, env: dict, properties: dict):
-    async with httpx.AsyncClient() as client:
-        await client.patch(
-            "https://api.notion.com/v1/pages/" + page_id,
-            headers={"Authorization": "Bearer " + env.get("NOTION_TOKEN", ""), "Notion-Version": NV, "Content-Type": "application/json"},
-            json={"properties": properties}
-        )
+    await notion("pages/" + page_id, env, {"properties": properties}, method="PATCH")
+
+async def notion_archive_page(page_id: str, env: dict):
+    await notion("pages/" + page_id, env, {"archived": True}, method="PATCH")
 
 @app.get("/api/health")
 async def health():
@@ -636,7 +637,13 @@ async def api_suspender_reserva(body: ActionRequest):
         "parent": {"database_id": DB_NO_REALIZADAS},
         "properties": props
     })
-    await notion_update_page(body.reservationId, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
+    
+    # Archivar / eliminar de reservas confirmadas activas
+    try:
+        await notion_archive_page(body.reservationId, ENV_CONFIG)
+    except Exception:
+        await notion_update_page(body.reservationId, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
+
     return {"ok": True}
 
 @app.post("/api/confirmar-solicitud")
@@ -690,7 +697,11 @@ async def api_rechazar_solicitud(body: ActionRequest):
         "parent": {"database_id": DB_NO_REALIZADAS},
         "properties": props
     })
-    await notion_update_page(body.requestId, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
+    try:
+        await notion_archive_page(body.requestId, ENV_CONFIG)
+    except Exception:
+        await notion_update_page(body.requestId, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
+
     return {"ok": True}
 
 @app.post("/api/revisar-correo")
@@ -700,7 +711,7 @@ async def api_revisar_correo():
 
 
 # =========================================================
-# HTML FRONTEND (INTERFAZ COMPLETA + SUSPENSIONES Y RECHAZOS)
+# HTML FRONTEND (INTERFAZ COMPLETA + MODALES DESPLEGABLES)
 # =========================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -733,6 +744,14 @@ button,.wa{display:block;width:100%;padding:13px;border:0;border-radius:10px;bac
 .error{color:#b91c1c;font-weight:bold}
 .dropdown-btn{background:#4b5563;margin-top:8px}
 .dropdown-content{display:none;margin-top:10px;padding-left:10px;border-left:3px solid #e5e7eb}
+
+/* Estilos para los modales desplegables */
+.modal{display:none;position:fixed;z-index:100;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,0.5);justify-content:center;align-items:center}
+.modal-content{background:#fff;padding:20px;border-radius:14px;width:90%;max-width:400px;box-shadow:0 4px 15px #0003}
+.modal-content label{display:block;font-weight:bold;margin-top:12px;margin-bottom:5px}
+.modal-content select{width:100%;padding:10px;border-radius:8px;border:1px solid #ccc;font-size:15px}
+.modal-btns{display:flex;gap:10px;margin-top:20px}
+.modal-btns button{margin-top:0}
 </style>
 </head>
 <body>
@@ -767,11 +786,52 @@ Revisa INBOX, comprueba Notion y disponibilidad, crea la solicitud y se detiene 
 </div>
 <button class="refresh" onclick="cargar()">🔄 Actualizar</button>
 </main>
+
+<!-- Modal para Suspender Reserva -->
+<div id="modalSuspender" class="modal">
+<div class="modal-content">
+<div class="title">⚠️ Suspender / Cancelar Reserva</div>
+<label for="selectMotivoSusp">Motivo de la suspensión:</label>
+<select id="selectMotivoSusp">
+<option value="Suspende cliente">Suspende cliente</option>
+<option value="Suspendemos nosotros">Suspendemos nosotros</option>
+</select>
+<label for="selectSenal">Señal de 10 €:</label>
+<select id="selectSenal">
+<option value="Devuelta">Devuelta</option>
+<option value="No devuelta">No devuelta</option>
+<option value="N/A">N/A</option>
+</select>
+<div class="modal-btns">
+<button class="action" onclick="ejecutarSuspension()">Confirmar</button>
+<button class="refresh" onclick="cerrarModales()">Cancelar</button>
+</div>
+</div>
+</div>
+
+<!-- Modal para Rechazar Solicitud -->
+<div id="modalRechazar" class="modal">
+<div class="modal-content">
+<div class="title">❌ Rechazar Solicitud</div>
+<label for="selectMotivoRech">Motivo del rechazo:</label>
+<select id="selectMotivoRech">
+<option value="Rechazada por el cliente">Rechazada por el cliente</option>
+<option value="Rechazada por nosotros">Rechazada por nosotros</option>
+</select>
+<div class="modal-btns">
+<button class="action" onclick="ejecutarRechazo()">Confirmar</button>
+<button class="refresh" onclick="cerrarModales()">Cancelar</button>
+</div>
+</div>
+</div>
+
 <script>
 function safe(value, fallback){
 if(value===null||value===undefined||value===""){return fallback||"";}
 return String(value);
 }
+
+let targetIdToProcess = null;
 
 async function cargar(){
 const sol=document.getElementById("sol");
@@ -863,14 +923,18 @@ await cargar();
 }catch(e){alert("❌ "+e.message);}
 }
 
-async function rechazarSolicitud(requestId){
-if(!requestId){alert("No se ha encontrado el ID.");return;}
-const motivo = prompt("¿Quién rechaza esta solicitud?\\n\\nEscribe 1 para: Rechazada por el cliente\\nEscribe 2 para: Rechazada por nosotros", "1");
-if(!motivo) return;
-const motivoTexto = (motivo.trim() === "2") ? "Rechazada por nosotros" : "Rechazada por el cliente";
+function abrirModalRechazar(requestId){
+targetIdToProcess = requestId;
+document.getElementById("modalRechazar").style.display = "flex";
+}
+
+async function ejecutarRechazo(){
+if(!targetIdToProcess) return;
+const motivo = document.getElementById("selectMotivoRech").value;
+cerrarModales();
 
 try{
-const r=await fetch("/api/rechazar-solicitud",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({requestId, motivo: motivoTexto})});
+const r=await fetch("/api/rechazar-solicitud",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({requestId: targetIdToProcess, motivo: motivo})});
 const data=await r.json();
 if(!r.ok||!data.ok)throw new Error(data.error||"No se pudo rechazar");
 alert("✅ Solicitud rechazada y movida al histórico.");
@@ -878,25 +942,30 @@ await cargar();
 }catch(e){alert("❌ "+e.message);}
 }
 
-async function suspenderReserva(reservationId){
-if(!reservationId){alert("No se ha encontrado el ID.");return;}
-const motivo = prompt("¿Motivo de la suspensión?\\n\\nEscribe 1 para: Suspende cliente\\nEscribe 2 para: Suspendemos nosotros", "1");
-if(!motivo) return;
-const motivoTexto = (motivo.trim() === "2") ? "Suspendemos nosotros" : "Suspende cliente";
+function abrirModalSuspender(reservationId){
+targetIdToProcess = reservationId;
+document.getElementById("modalSuspender").style.display = "flex";
+}
 
-const senal = prompt("¿Qué ocurre con la señal de 10 €?\\n\\nEscribe 1 para: Devuelta\\nEscribe 2 para: No devuelta\\nEscribe 3 para: N/A", "1");
-if(!senal) return;
-let senalTexto = "Devuelta";
-if(senal.trim() === "2") senalTexto = "No devuelta";
-else if(senal.trim() === "3") senalTexto = "N/A";
+async function ejecutarSuspension(){
+if(!targetIdToProcess) return;
+const motivo = document.getElementById("selectMotivoSusp").value;
+const senal = document.getElementById("selectSenal").value;
+cerrarModales();
 
 try{
-const r=await fetch("/api/suspender-reserva",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({reservationId, motivo: motivoTexto, senal: senalTexto})});
+const r=await fetch("/api/suspender-reserva",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({reservationId: targetIdToProcess, motivo: motivo, senal: senal})});
 const data=await r.json();
 if(!r.ok||!data.ok)throw new Error(data.error||"No se pudo suspender la reserva");
 alert("✅ Reserva suspendida y movida al histórico.");
 await cargar();
 }catch(e){alert("❌ "+e.message);}
+}
+
+function cerrarModales(){
+document.getElementById("modalSuspender").style.display = "none";
+document.getElementById("modalRechazar").style.display = "none";
+targetIdToProcess = null;
 }
 
 async function marcarSesionRealizada(reservationId){
@@ -919,7 +988,7 @@ output+="<strong>"+safe(x.nombre,"Sin nombre")+"</strong>";
 output+='<div class="info">📅 '+safe(x.fechaTexto,"Sin fecha")+"<br>🕐 "+safe(x.horaTexto,"Sin hora")+"<br>👥 "+safe(x.jugadores,"Sin dato")+" personas<br>🎯 "+safe(x.version,"Sin versión")+"</div>";
 if(x.whatsapp){output+='<a class="wa" href="'+x.whatsapp+'" target="_blank" rel="noopener">💬 Abrir WhatsApp</a>';}
 output+='<button class="action" onclick="confirmarSolicitud(\\''+x.id+'\\')">✅ CONFIRMAR RESERVA</button>';
-output+='<button class="action" onclick="rechazarSolicitud(\\''+x.id+'\\')">❌ RECHAZAR SOLICITUD</button>';
+output+='<button class="action" onclick="abrirModalRechazar(\\''+x.id+'\\')">❌ RECHAZAR SOLICITUD</button>';
 output+="</div>";
 });
 document.getElementById("sol").innerHTML=output;
@@ -937,7 +1006,7 @@ output+='<div class="card"><strong>'+safe(x.nombre,"Sin nombre")+"</strong>";
 if(i===0){output+='<div class="badge">⭐ Próxima</div>';}
 output+='<div class="info">📅 '+safe(x.fechaTexto)+"<br>🕐 "+safe(x.horaTexto)+"<br>👥 "+safe(x.jugadores)+" personas<br>🎯 "+safe(x.version)+"</div>";
 output+='<button class="action" onclick="marcarSesionRealizada(\\''+x.id+'\\')">✅ SESIÓN REALIZADA + PAGO RECIBIDO</button>';
-output+='<button class="suspend" onclick="suspenderReserva(\\''+x.id+'\\')">⚠️ SUSPENDER / CANCELAR RESERVA</button>';
+output+='<button class="suspend" onclick="abrirModalSuspender(\\''+x.id+'\\')">⚠️ SUSPENDER / CANCELAR RESERVA</button>';
 output+="</div>";
 });
 document.getElementById("res").innerHTML=output;
