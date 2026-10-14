@@ -592,7 +592,7 @@ class ActionRequest(BaseModel):
 
 @app.post("/api/sesion-realizada")
 async def api_sesion_realizada(body: ActionRequest):
-    reservation = await notion("pages/" + body.reservationId, ENV_CONFIG)
+    reservation = await notion("pages/" + body.reservationId, ENV_CONFIG, method="GET")
     p = reservation.get("properties", {})
     
     await notion("pages", ENV_CONFIG, {
@@ -626,7 +626,7 @@ async def api_suspender_reserva(request: Request):
     if not reservation_id:
         raise HTTPException(status_code=400, detail="Falta el ID de la reserva.")
         
-    reservation = await notion("pages/" + reservation_id, ENV_CONFIG)
+    reservation = await notion("pages/" + body.reservationId, ENV_CONFIG, method="GET")
     p = reservation.get("properties", {})
     
     props = {
@@ -662,7 +662,7 @@ async def api_suspender_reserva(request: Request):
 
 @app.post("/api/confirmar-solicitud")
 async def api_confirmar_solicitud(body: ActionRequest):
-    r = await notion("pages/" + body.requestId, ENV_CONFIG)
+    r = await notion("pages/" + body.requestId, ENV_CONFIG, method="GET")
     p = r.get("properties", {})
     fecha = date_prop(p.get("Fecha"))
     h_val = hora(p.get("Hora"))
@@ -689,7 +689,7 @@ async def api_confirmar_solicitud(body: ActionRequest):
 
 @app.post("/api/rechazar-solicitud")
 async def api_rechazar_solicitud(body: ActionRequest):
-    r = await notion("pages/" + body.requestId, ENV_CONFIG)
+    r = await notion("pages/" + body.requestId, ENV_CONFIG, method="GET")
     p = r.get("properties", {})
     
     props = {
