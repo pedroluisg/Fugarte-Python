@@ -60,6 +60,7 @@ async def notion(url: str, env: dict, body: dict = None, method: str = "POST") -
         )
     return data
 
+
 async def query_all(database: str, env: dict, body: dict = None) -> list:
     results = []
     cursor = None
@@ -116,7 +117,7 @@ def phone(p: Any) -> str:
 def date_prop(p: Any) -> str:
     if not p or not p.get("date") or not p["date"].get("start"):
         return ""
-    return p["date"]["start"]
+    return p["date"]["start"][:10]
 
 
 def hora(p: Any) -> str:
@@ -135,6 +136,9 @@ def hora(p: Any) -> str:
     
     try:
         if "T" in val or ":" in val:
+            if re.match(r"^\d{1,2}:\d{2}$", val.strip()):
+                partes = val.strip().split(":")
+                return f"{partes[0].zfill(2)}:{partes[1]}"
             if not val.endswith("Z") and "+" not in val and "-" not in val[10:]:
                 val += "Z"
             dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
@@ -365,61 +369,261 @@ def extract_date_from_mail(text: str) -> str:
     return ""
 
 
-def extract_time_from_mail(text: str) -> str:
-    m = re.search(r"\b([01]?\d|2[0-3])\s*[:hH\.]\s*([0-5]\d)\b", text)
-    if m:
-        return f"{m.group(1).zfill(2)}:{m.group(2)}"
-    m = re.search(r"\b([01]?\d|2[0-3])\s*h(?:oras?)?\b", text, re.IGNORECASE)
-    if m:
-        return f"{m.group(1).zfill(2)}:00"
-    return ""
+def normalizar_hora_humana(h: int, m: int, contexto: str) -> str:
+    ctx = contexto.lower()
+    if 1 <= h <= 9:
+        h += 12
+    elif h == 10 and any(w in ctx for w in ["noche", "tarde", "pm"]):
+        h = 22
+    elif h == 12 and "noche" in ctx:
+        h = 22
+    # Ajustar minutos a :00 o :30 (sin cuartos)
+    if m < 15:
+        m_norm = 0
+    elif m < 45:
+        m_norm = 30
+    else:
+        m_norm = 0
+        h += 1
+    if h < 10:
+        h, m_norm = 10, 0
+    if h > 22 or (h == 22 and m_norm > 0):
+        h, m_norm = 22, 0
+    return f"{str(h).zfill(2)}:{str(m_norm).zfill(2)}"
+
+
+def extract_preference_segment(text: str) -> str:
+    """Extrae preferentemente las líneas de comentarios/horario del cliente para no confundirse con cabeceras del email."""
+    limpio = re.sub(r"<[^>]*>", " ", text or "")
+    # Quitar fechas YYYY-MM-DD o DD/MM/YYYY y teléfonos para que sus números no parezcan horas
+    limpio = re.sub(r"\b20\d{2}[-\/]\d{1,2}[-\/]\d{1,2}\b", " ", limpio)
+    limpio = re.sub(r"\b\d{1,2}[\/-]\d{1,2}[\/-]20\d{2}\b", " ", limpio)
+    limpio = re.sub(r"(?:\+34|0034)?[\s().-]*[6789](?:[\s().-]*\d){8}(?!\d)", " ", limpio)
+    # Quitar cabeceras técnicas tipo "Enviado el ... a las 14:23"
+    limpio = re.sub(r"(?:enviado|sent|date|fecha de env[íi]o).*?\d{1,2}:\d{2}", " ", limpio, flags=re.IGNORECASE)
+    return limpio
 
 
 def extract_after_from_mail(text: str) -> str:
-    m = re.search(r"(?:a partir de|desde|después de|a las)\s*([01]?\d|2[0-3])(?:[:h\.]([0-5]\d))?", text, re.IGNORECASE)
+    limpio = extract_preference_segment(text)
+    mapa_num = {"una": 1, "dos": 2, "tres": 3, "cuatro": 4, "cinco": 5, "seis": 6, "siete": 7, "ocho": 8, "nueve": 9, "diez": 10, "once": 11, "doce": 12}
+    
+    m = re.search(r"(?:a partir de|desde|despu[ée]s de)\s*(?:las?\s*)?([01]?\d|2[0-3])(?:\s*[:hH\.]\s*([0-5]\d))?(?:\s*y\s*media)?", limpio, re.IGNORECASE)
     if m:
-        return f"{m.group(1).zfill(2)}:{m.group(2) or '00'}"
+        h = int(m.group(1))
+        mins = int(m.group(2)) if m.group(2) else (30 if "media" in m.group(0).lower() else 0)
+        return normalizar_hora_humana(h, mins, limpio)
+        
+    for palabra, num_h in mapa_num.items():
+        m_pal = re.search(rf"(?:a partir de|desde|despu[ée]s de)\s*(?:las?\s*)?\b{palabra}\b(\s*y\s*media)?", limpio, re.IGNORECASE)
+        if m_pal:
+            mins = 30 if m_pal.group(1) else 0
+            return normalizar_hora_humana(num_h, mins, limpio)
     return ""
 
 
 def extract_before_from_mail(text: str) -> str:
-    m = re.search(r"(?:antes de|hasta|no más tarde de)\s*([01]?\d|2[0-3])(?:[:h\.]([0-5]\d))?", text, re.IGNORECASE)
+    limpio = extract_preference_segment(text)
+    mapa_num = {"una": 1, "dos": 2, "tres": 3, "cuatro": 4, "cinco": 5, "seis": 6, "siete": 7, "ocho": 8, "nueve": 9, "diez": 10, "once": 11, "doce": 12}
+
+    m = re.search(r"(?:antes de|hasta|no m[áa]s tarde de|como tarde a)\s*(?:las?\s*)?([01]?\d|2[0-3])(?:\s*[:hH\.]\s*([0-5]\d))?(?:\s*y\s*media)?", limpio, re.IGNORECASE)
     if m:
-        return f"{m.group(1).zfill(2)}:{m.group(2) or '00'}"
+        h = int(m.group(1))
+        mins = int(m.group(2)) if m.group(2) else (30 if "media" in m.group(0).lower() else 0)
+        return normalizar_hora_humana(h, mins, limpio)
+
+    for palabra, num_h in mapa_num.items():
+        m_pal = re.search(rf"(?:antes de|hasta|no m[áa]s tarde de|como tarde a)\s*(?:las?\s*)?\b{palabra}\b(\s*y\s*media)?", limpio, re.IGNORECASE)
+        if m_pal:
+            mins = 30 if m_pal.group(1) else 0
+            return normalizar_hora_humana(num_h, mins, limpio)
+    return ""
+
+
+def extract_time_from_mail(text: str) -> str:
+    """Extrae una hora específica pedida por el cliente (ej. '18:00', 'a las 6', 'sobre las seis y media').
+    Si el cliente solo expresa un tramo ('a partir de las 10', 'por la tarde'), devuelve '' para usar la lógica de tramo."""
+    limpio = extract_preference_segment(text)
+    # Eliminar expresiones de rango ('a partir de...', 'antes de...') para no confundir el límite de un tramo con una hora fija
+    sin_rangos = re.sub(
+        r"(?:a partir de|desde|despu[ée]s de|antes de|hasta|no m[áa]s tarde de|como tarde a)\s*(?:las?\s*)?(?:[01]?\d|2[0-3]|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)(?:\s*[:hH\.]\s*[0-5]\d)?(?:\s*y\s*media)?",
+        " ",
+        limpio,
+        flags=re.IGNORECASE
+    )
+
+    # 1. Formato HH:MM o HH.MM o HHhMM (ej. 18:30, 19.00, 18h30)
+    m = re.search(r"\b([01]?\d|2[0-3])\s*[:hH\.]\s*([0-5]\d)\b", sin_rangos)
+    if m:
+        return normalizar_hora_humana(int(m.group(1)), int(m.group(2)), sin_rangos)
+
+    # 2. Formato "18h" o "18 horas" o "a las 6" o "sobre las 19 y media"
+    m = re.search(r"(?:(?:a|sobre|hacia)\s+las?\s+|hora\s*[:\-]?\s*)([01]?\d|2[0-3])(?:\s*y\s*(media|cuarto))?\b", sin_rangos, re.IGNORECASE)
+    if m:
+        h = int(m.group(1))
+        mins = 30 if (m.group(2) and "media" in m.group(2).lower()) else 0
+        return normalizar_hora_humana(h, mins, sin_rangos)
+
+    m = re.search(r"\b([01]?\d|2[0-3])\s*h(?:oras?)?\b", sin_rangos, re.IGNORECASE)
+    if m:
+        return normalizar_hora_humana(int(m.group(1)), 0, sin_rangos)
+
+    # 3. Horas escritas con palabras ("sobre las seis", "a las siete y media", "las ocho")
+    mapa_num = {
+        "una": 1, "dos": 2, "tres": 3, "cuatro": 4, "cinco": 5,
+        "seis": 6, "siete": 7, "ocho": 8, "nueve": 9, "diez": 10,
+        "once": 11, "doce": 12
+    }
+    for palabra, num_h in mapa_num.items():
+        patron_pal = rf"(?:(?:a|sobre|hacia)\s+las?\s+|\blas\s+){palabra}(?:\s+y\s+(media))?\b"
+        m_pal = re.search(patron_pal, sin_rangos, re.IGNORECASE)
+        if m_pal:
+            mins = 30 if m_pal.group(1) else 0
+            return normalizar_hora_humana(num_h, mins, sin_rangos)
+
     return ""
 
 
 def minutes_of(time_str: str) -> Optional[int]:
-    m = re.match(r"^(\d{2}):(\d{2})$", time_str or "")
+    m = re.match(r"^(\d{1,2}):(\d{2})$", (time_str or "").strip())
     if not m:
         return None
     return int(m.group(1)) * 60 + int(m.group(2))
 
 
-def resolver_hora_flexible(text: str, after: str, before: str) -> str:
-    texto_lower = text.lower()
-    # Las horas típicas de tarde mencionadas sin especificar se consideran tarde (18:00+)
-    mencion_tarde = any(w in texto_lower for w in ["seis", "siete", "ocho", "nueve", "diez", "tarde", "noches", "vesprada", "pm", "17:", "18:", "19:", "20:", "21:", "18h", "19h", "20h"])
-    es_tarde = mencion_tarde and not "mañana" in texto_lower
-    
-    objetivo_minutos = 18 * 60 + 30 if es_tarde else 12 * 60
-    
-    min_m = minutes_of(after) if after else (16 * 60 if es_tarde else 9 * 60)
-    max_m = minutes_of(before) if before else (22 * 60 if es_tarde else 15 * 60)
-    
-    mejor_slot = None
-    menor_distancia = 999999
-    
-    for h in range(0, 24):
-        for m in range(0, 60, 30):
-            total_m = h * 60 + m
-            if min_m <= total_m <= max_m:
-                dist = abs(total_m - objetivo_minutos)
-                if dist < menor_distancia:
-                    menor_distancia = dist
-                    mejor_slot = f"{str(h).zfill(2)}:{str(m).zfill(2)}"
-                    
-    return mejor_slot or ("18:30" if es_tarde else "12:00")
+def str_from_minutes(total_m: int) -> str:
+    return f"{str(total_m // 60).zfill(2)}:{str(total_m % 60).zfill(2)}"
+
+
+def calcular_mejor_horario(
+    fecha: str,
+    version_nueva: str,
+    hora_exacta_pedida: str,
+    after: str,
+    before: str,
+    text: str,
+    sesiones_ocupadas_dia: list,
+    ahora: datetime
+) -> tuple[Optional[str], Optional[str], bool]:
+    """
+    Calcula el mejor horario disponible siguiendo las 7 reglas de negocio:
+    - Huecos posibles de 10:00 a 22:00 en intervalos de 30 min (:00 y :30).
+    - Margen de 120 min (2h) para sesiones NORMAL y 150 min (2h30m) para sesiones PRO.
+    - Si es para hoy, al menos 60 min después de la hora actual (`ahora`).
+    - Si pide hora exacta -> busca la libre más cercana a esa hora.
+    - Si pide tramo -> busca la libre más cercana a 12:00 (mañana) o 18:30 (tarde).
+    - Si el turno pedido (mañana/tarde) está completo -> primera libre de tarde (si pidió mañana) o última libre de mañana (si pidió tarde).
+    Devuelve: (mejor_hora_str, hora_referencia_cliente, fue_desplazada)
+    """
+    # 1. Generar todos los slots de 10:00 (600) a 22:00 (1320) cada 30 min
+    todos_los_slots = list(range(10 * 60, 22 * 60 + 1, 30))
+
+    # Regla 3: Al menos 1 hora más tarde de la hora de descarga si la reserva es para hoy
+    hoy_str = ahora.strftime("%Y-%m-%d")
+    minimo_por_reloj = 0
+    if fecha == hoy_str:
+        minimo_por_reloj = (ahora.hour * 60 + ahora.minute) + 60
+    elif fecha < hoy_str:
+        return None, hora_exacta_pedida or None, False
+
+    duracion_nueva = 150 if (version_nueva or "").upper() == "PRO" else 120
+
+    # 2. Filtrar los slots que respetan a TODAS las reservas y solicitudes del día (Reglas 1 y 2)
+    slots_libres = []
+    for cand in todos_los_slots:
+        if cand < minimo_por_reloj:
+            continue
+        choca = False
+        for oc in sesiones_ocupadas_dia:
+            t_ex = minutes_of(oc.get("hora", ""))
+            if t_ex is None:
+                continue
+            ver_ex = (oc.get("version") or "NORMAL").upper()
+            dur_ex = 150 if ver_ex == "PRO" else 120
+
+            if cand == t_ex:
+                choca = True
+                break
+            elif cand < t_ex:
+                # La nueva sesión empieza antes que la existente: debe terminar antes de t_ex
+                if cand + duracion_nueva > t_ex:
+                    choca = True
+                    break
+            else:
+                # La nueva sesión empieza después que la existente: debe empezar cuando haya acabado la existente (2h o 2.5h)
+                if t_ex + dur_ex > cand:
+                    choca = True
+                    break
+        if not choca:
+            slots_libres.append(cand)
+
+    if not slots_libres:
+        return None, hora_exacta_pedida or None, False
+
+    # División Mañana (10:00 a 15:30 -> 600 a 930) y Tarde (16:00 a 22:00 -> 960 a 1320)
+    LIMITE_MANANA = 15 * 60 + 30  # 15:30
+
+    # 3. Determinar si el cliente pidió una hora concreta o un tramo
+    min_rango = minutes_of(after) if after else None
+    max_rango = minutes_of(before) if before else None
+
+    if hora_exacta_pedida:
+        objetivo = minutes_of(hora_exacta_pedida)
+        es_preferencia_tarde = (objetivo >= 16 * 60)
+        hora_ref_cliente = hora_exacta_pedida
+    else:
+        limpio_lower = extract_preference_segment(text).lower()
+        mencion_manana = any(w in limpio_lower for w in ["mañana", "matí", "mediodia", "mediodía", "am"])
+        mencion_tarde = any(w in limpio_lower for w in ["tarde", "noche", "noches", "vesprada", "pm"])
+
+        if min_rango is not None and not mencion_manana and not mencion_tarde:
+            es_preferencia_tarde = (min_rango >= 15 * 60)
+        elif max_rango is not None and not mencion_manana and not mencion_tarde:
+            es_preferencia_tarde = (max_rango > 16 * 60)
+        elif mencion_manana and not mencion_tarde:
+            es_preferencia_tarde = False
+        else:
+            # Si dice "tarde" o no especifica nada concreto, priorizamos según mención (mañana -> 12:00, tarde -> 18:30)
+            es_preferencia_tarde = True if mencion_tarde else False
+
+        objetivo = (18 * 60 + 30) if es_preferencia_tarde else (12 * 60)
+        hora_ref_cliente = None
+
+    # 4. Seleccionar candidatos dentro del turno preferido (respetando after/before si los hay)
+    slots_manana = [s for s in slots_libres if s <= LIMITE_MANANA]
+    slots_tarde = [s for s in slots_libres if s > LIMITE_MANANA]
+
+    turno_preferido = slots_tarde if es_preferencia_tarde else slots_manana
+
+    # Aplicar filtros "a partir de" / "antes de" si existen dentro del turno
+    candidatos_turno = turno_preferido
+    if min_rango is not None:
+        filtrados = [s for s in candidatos_turno if s >= min_rango]
+        if filtrados:
+            candidatos_turno = filtrados
+    if max_rango is not None:
+        filtrados = [s for s in candidatos_turno if s <= max_rango]
+        if filtrados:
+            candidatos_turno = filtrados
+
+    if candidatos_turno:
+        # Elegir el hueco libre más cercano al objetivo (si hay empate, prioriza la hora solicitada o la más cercana)
+        mejor_m = min(candidatos_turno, key=lambda s: abs(s - objetivo))
+    else:
+        # Regla 6: Si el turno pedido está completamente ocupado:
+        # - Si pedía mañana -> primera libre de la tarde
+        # - Si pedía tarde -> última libre de la mañana
+        if not es_preferencia_tarde and slots_tarde:
+            mejor_m = min(slots_tarde)  # Primera de la tarde
+        elif es_preferencia_tarde and slots_manana:
+            mejor_m = max(slots_manana)  # Última de la mañana
+        else:
+            mejor_m = min(slots_libres, key=lambda s: abs(s - objetivo))
+
+    mejor_hora_str = str_from_minutes(mejor_m)
+    fue_desplazada = bool(hora_ref_cliente and hora_ref_cliente != mejor_hora_str)
+    return mejor_hora_str, hora_ref_cliente, fue_desplazada
+
 
 def extract_players_from_mail(text: str) -> Optional[int]:
     patterns = [
@@ -477,6 +681,12 @@ async def revisar_correo_logic(env: dict):
     if not isinstance(messages, list) or not messages:
         return []
 
+    # Descargamos todas las reservas confirmadas y solicitudes pendientes para cruzar disponibilidad y duplicados
+    reservas_activas = await reservas(env)
+    solicitudes_activas = await solicitudes(env)
+    todas_ocupadas = reservas_activas + solicitudes_activas
+    ahora = datetime.now(TZ)
+
     actions = []
     for msg in messages:
         uid = str(msg.get("uid") or msg.get("id") or "")
@@ -488,45 +698,108 @@ async def revisar_correo_logic(env: dict):
         text = subject + "\n" + mail_text(detail)
 
         fecha = extract_date_from_mail(text)
-        hora_solicitada = extract_time_from_mail(text)
-        after = extract_after_from_mail(text)
-        before = extract_before_from_mail(text)
-        
-        # --- MEJORA 1: Detectar horas relativas ("seis", "siete", etc.) incluso si no ponen números ---
-        texto_lower = text.lower()
-        mencion_tarde = any(w in texto_lower for w in ["seis", "siete", "ocho", "nueve", "diez", "tarde", "noches", "vesprada", "pm", "17:", "18:", "19:", "20:", "21:", "18h", "19h", "20h"])
-        
-        if not hora_solicitada and (after or before or mencion_tarde or "mañana" in text.lower() or "10" in text or "11" in text or "17" in text):
-            hora_solicitada = resolver_hora_flexible(text, after, before)
-
         jugadores = extract_players_from_mail(text)
         version = extract_version_from_mail(text)
         telefono = extract_phone_from_mail(text)
         nombre = extract_name_from_mail(text, subject)
 
-        if not fecha or jugadores is None or not hora_solicitada:
+        if not fecha or jugadores is None:
             continue
 
-        # --- MEJORA 2: Validación Anti-Doble Booking ---
-        # Comprobamos si ya existe una reserva confirmada en esa misma fecha y hora exactas
-        reservas_existentes = await reservas(env)
-        ocupado = any(r.get("fecha") == fecha and r.get("hora") == hora_solicitada for r in reservas_existentes)
+        # --- MEJORA 3: Evitar duplicados del mismo cliente en la misma fecha ---
+        tel_limpio = re.sub(r"\D", "", telefono or "")[-9:] if telefono else ""
+        nombre_limpio = (nombre or "").strip().lower()
+        ocupadas_mismo_dia = [x for x in todas_ocupadas if x.get("fecha") == fecha]
 
-        if ocupado:
+        es_duplicado = False
+        for ex in ocupadas_mismo_dia:
+            ex_tel = re.sub(r"\D", "", ex.get("telefono") or "")[-9:] if ex.get("telefono") else ""
+            ex_nom = (ex.get("nombre") or "").strip().lower()
+            if (tel_limpio and ex_tel and tel_limpio == ex_tel) or (nombre_limpio and ex_nom and nombre_limpio == ex_nom):
+                es_duplicado = True
+                break
+
+        if es_duplicado:
+            try:
+                await hostinger_move(env, uid)
+            except Exception:
+                pass
+            continue
+
+        # Extraer preferencia de hora o tramo del correo
+        hora_exacta_pedida = extract_time_from_mail(text)
+        after = extract_after_from_mail(text)
+        before = extract_before_from_mail(text)
+
+        hora_asignada, hora_pedida_ref, fue_desplazada = calcular_mejor_horario(
+            fecha=fecha,
+            version_nueva=version,
+            hora_exacta_pedida=hora_exacta_pedida,
+            after=after,
+            before=before,
+            text=text,
+            sesiones_ocupadas_dia=ocupadas_mismo_dia,
+            ahora=ahora
+        )
+
+        # --- MEJORA 2: Si el día está 100% completo -> Pasar directamente a Solicitudes Rechazadas (por nosotros) ---
+        if not hora_asignada:
+            hora_ref = hora_exacta_pedida or after or "12:00"
+            try:
+                dt_base_rech = datetime.fromisoformat(fecha + "T" + hora_ref + ":00").replace(tzinfo=TZ)
+                hora_utc_rech = dt_base_rech.astimezone(zoneinfo.ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+            except Exception:
+                hora_utc_rech = fecha + "T10:00:00Z"
+
+            props_rech = {
+                "Nombre": {"title": [{"text": {"content": nombre or "Solicitud web"}}]},
+                "Fecha": {"date": {"start": fecha}},
+                "Hora": {"date": {"start": hora_utc_rech}},
+                "Jugadores": {"number": jugadores},
+                "Versión": {"select": {"name": version}},
+                "Tipo": {"select": {"name": "RECHAZADA"}},
+                "Motivo": {"select": {"name": "Rechazada por nosotros"}}
+            }
+            if telefono:
+                props_rech["Teléfono"] = {"phone_number": telefono}
+
+            await notion("pages", env, {
+                "parent": {"database_id": DB_NO_REALIZADAS},
+                "properties": props_rech
+            }, method="POST")
+
+            try:
+                await hostinger_move(env, uid)
+            except Exception:
+                pass
+
+            mensaje_completo = (
+                f"Hola{((' ' + nombre) if nombre else '')}, escribo de Fugarte Escape Room.\n\n"
+                f"Muchas gracias por vuestro interés, pero lamentablemente tenemos el {fmt_date(fecha)} completo y no nos queda ningún hueco disponible.\n\n"
+                "Si os viene bien cualquier otro día, estaremos encantados de recibiros.\n\n"
+                "¡Muchas gracias y disculpad las molestias! 😊"
+            )
+
             actions.append({
-                "type": "CONFLICT",
+                "type": "REJECTED_FULL",
                 "uid": uid,
                 "subject": subject,
                 "nombre": nombre,
                 "fecha": fecha,
-                "hora": hora_solicitada,
-                "reason": "⚠️ CONFLICTO CRÍTICO: El horario solicitado ya está ocupado por otra reserva confirmada. No se ha creado la solicitud para evitar duplicados."
+                "hora": hora_pedida_ref or "Día completo",
+                "jugadores": jugadores,
+                "version": version,
+                "telefono": telefono,
+                "whatsapp": wa(telefono, mensaje_completo),
+                "reason": "🚫 DÍA COMPLETO: Movida automáticamente a Solicitudes Rechazadas (Rechazada por nosotros). Pulsa debajo para avisar al cliente por WhatsApp."
             })
             break
-        # -----------------------------------------------
 
-        dt_base = datetime.fromisoformat(fecha + "T" + hora_solicitada + ":00").replace(tzinfo=TZ)
+        # --- Creación normal o con hora alternativa cercana (MEJORA 1) ---
+        dt_base = datetime.fromisoformat(fecha + "T" + hora_asignada + ":00").replace(tzinfo=TZ)
         hora_utc = dt_base.astimezone(zoneinfo.ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+
+        nota_extra = f" (Pidió {hora_pedida_ref}, asignada {hora_asignada} por disponibilidad)" if fue_desplazada else ""
 
         created = await notion("pages", env, {
             "parent": {"database_id": DB_SOL},
@@ -540,7 +813,7 @@ async def revisar_correo_logic(env: dict):
                 "Versión": {"select": {"name": version}},
                 "Origen": {"select": {"name": "WEB"}},
                 "Teléfono": {"phone_number": telefono} if telefono else {"phone_number": None},
-                "Notas": {"rich_text": [{"text": {"content": f"Solicitud recibida por Hostinger INBOX. UID {uid}."}}]}
+                "Notas": {"rich_text": [{"text": {"content": f"Solicitud recibida por Hostinger INBOX. UID {uid}.{nota_extra}"}}]}
             }
         })
 
@@ -549,14 +822,26 @@ async def revisar_correo_logic(env: dict):
         except Exception:
             pass
 
-        mensaje = (
-            f"Hola{((' ' + nombre) if nombre else '')}, escribo de Fugarte Escape Room.\n\n"
-            f"Tenemos disponibilidad el {fmt_date(fecha)} a las {hora_solicitada} para {jugadores} personas.\n\n"
-            "Si queréis confirmar la reserva, sería necesario hacer un Bizum de 10 € a este número de teléfono.\n\n"
-            "Una vez recibido, dejamos la reserva confirmada.\n\n"
-            "Si finalmente no estáis interesados, por favor contestad a este WhatsApp para que podamos ofrecer el horario a otros usuarios.\n\n"
-            "¡Muchas gracias! 😊"
-        )
+        if fue_desplazada:
+            mensaje = (
+                f"Hola{((' ' + nombre) if nombre else '')}, escribo de Fugarte Escape Room.\n\n"
+                f"Para el {fmt_date(fecha)} la hora que nos indicáis ({hora_pedida_ref}) ya está ocupada, pero tenemos disponibilidad a las {hora_asignada} para {jugadores} personas.\n\n"
+                "Si os encaja ese horario y queréis confirmar la reserva, sería necesario hacer un Bizum de 10 € a este número de teléfono.\n\n"
+                "Una vez recibido, dejamos la reserva confirmada.\n\n"
+                "Si finalmente no estáis interesados, por favor contestad a este WhatsApp para que podamos ofrecer el horario a otros usuarios.\n\n"
+                "¡Muchas gracias! 😊"
+            )
+            motivo_panel = f"⚠️ Pidió a las {hora_pedida_ref} (ocupado). Se ha asignado la hora libre más cercana: {hora_asignada}."
+        else:
+            mensaje = (
+                f"Hola{((' ' + nombre) if nombre else '')}, escribo de Fugarte Escape Room.\n\n"
+                f"Tenemos disponibilidad el {fmt_date(fecha)} a las {hora_asignada} para {jugadores} personas.\n\n"
+                "Si queréis confirmar la reserva, sería necesario hacer un Bizum de 10 € a este número de teléfono.\n\n"
+                "Una vez recibido, dejamos la reserva confirmada.\n\n"
+                "Si finalmente no estáis interesados, por favor contestad a este WhatsApp para que podamos ofrecer el horario a otros usuarios.\n\n"
+                "¡Muchas gracias! 😊"
+            )
+            motivo_panel = "Solicitud creada en Notion y correo movido a INBOX.Aceptadas."
 
         actions.append({
             "type": "CREATED",
@@ -565,16 +850,18 @@ async def revisar_correo_logic(env: dict):
             "requestId": created["id"],
             "nombre": nombre,
             "fecha": fecha,
-            "hora": hora_solicitada,
+            "hora": hora_asignada,
             "jugadores": jugadores,
             "version": version,
             "telefono": telefono,
             "whatsapp": wa(telefono, mensaje),
-            "reason": "Solicitud creada en Notion y correo movido a INBOX.Aceptadas."
+            "reason": motivo_panel
         })
         break
 
     return actions
+
+
 # =========================================================
 # ACCIONES DE NOTION Y ENDPOINTS API
 # =========================================================
@@ -612,26 +899,49 @@ class ActionRequest(BaseModel):
     senal: Optional[str] = None
 
 @app.post("/api/sesion-realizada")
-async def api_sesion_realizada(body: ActionRequest):
-    reservation = await notion("pages/" + body.reservationId, ENV_CONFIG, method="GET")
-    p = reservation.get("properties", {})
-    
-    await notion("pages", ENV_CONFIG, {
-        "parent": {"database_id": DB_SES},
-        "properties": {
-            "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Sesión"}}]},
-            "Fecha": {"date": {"start": date_prop(p.get("Fecha"))}},
-            "Hora": {"date": {"start": hora(p.get("Hora"))}},
-            "Jugadores": {"number": num(p.get("Jugadores"))},
-            "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}},
-            "Origen": {"select": {"name": prop(p.get("Origen")) or "WEB"}},
-            "Pago": {"select": {"name": "RECIBIDO"}},
-            "Fecha registro": {"date": {"start": datetime.now(TZ).isoformat()}},
-            "Reserva original": {"relation": [{"id": body.reservationId}]}
-        }
-    })
-    await notion_update_page(body.reservationId, ENV_CONFIG, {"Pago": {"select": {"name": "RECIBIDO"}}})
-    return {"ok": True, "alreadyExists": False}
+async def api_sesion_realizada(request: Request):
+    try:
+        body = await request.json()
+        reservation_id = body.get("reservationId")
+        if not reservation_id:
+            raise HTTPException(status_code=400, detail="Falta el ID de la reserva.")
+
+        reservation = await notion("pages/" + reservation_id, ENV_CONFIG, method="GET")
+        p = reservation.get("properties", {})
+        
+        fecha_val = date_prop(p.get("Fecha"))
+        h_val = hora(p.get("Hora"))
+        
+        hora_iso = None
+        if fecha_val:
+            t_str = h_val if (h_val and len(h_val) == 5) else "10:00"
+            try:
+                dt_base = datetime.fromisoformat(fecha_val + "T" + t_str + ":00").replace(tzinfo=TZ)
+                hora_iso = dt_base.astimezone(zoneinfo.ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+            except Exception:
+                hora_iso = fecha_val + "T10:00:00Z"
+
+        await notion("pages", ENV_CONFIG, {
+            "parent": {"database_id": DB_SES},
+            "properties": {
+                "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Sesión"}}]},
+                "Fecha": {"date": {"start": fecha_val}} if fecha_val else {"date": None},
+                "Hora": {"date": {"start": hora_iso}} if hora_iso else {"date": None},
+                "Jugadores": {"number": num(p.get("Jugadores"))},
+                "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}},
+                "Origen": {"select": {"name": prop(p.get("Origen")) or "WEB"}},
+                "Pago": {"select": {"name": "RECIBIDO"}},
+                "Fecha registro": {"date": {"start": datetime.now(TZ).isoformat()}},
+                "Reserva original": {"relation": [{"id": reservation_id}]}
+            }
+        }, method="POST")
+
+        await notion_update_page(reservation_id, ENV_CONFIG, {"Pago": {"select": {"name": "RECIBIDO"}}})
+        return {"ok": True, "alreadyExists": False}
+    except Exception as e:
+        print("ERROR EN SESIÓN REALIZADA:", str(e))
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+
 
 @app.post("/api/suspender-reserva")
 async def api_suspender_reserva(request: Request):
@@ -644,14 +954,12 @@ async def api_suspender_reserva(request: Request):
         if not reservation_id:
             raise HTTPException(status_code=400, detail="Falta el ID de la reserva a suspender.")
             
-        # 1. Consultar la página existente usando method="GET"
         reservation = await notion("pages/" + reservation_id, ENV_CONFIG, method="GET")
         p = reservation.get("properties", {})
         
         fecha_val = date_prop(p.get("Fecha"))
         h_val = hora(p.get("Hora"))
         
-        # Construir formato ISO válido combinando fecha y hora para Notion
         hora_iso = None
         if fecha_val:
             t_str = h_val if (h_val and len(h_val) == 5) else "10:00"
@@ -680,13 +988,11 @@ async def api_suspender_reserva(request: Request):
         
         props["Tipo"] = {"select": {"name": "SUSPENDIDA"}}
 
-        # 2. Crear el registro en el histórico
         await notion("pages", ENV_CONFIG, {
             "parent": {"database_id": DB_NO_REALIZADAS},
             "properties": props
         }, method="POST")
         
-        # 3. Archivar o cancelar la reserva original
         try:
             await notion_archive_page(reservation_id, ENV_CONFIG)
         except Exception:
@@ -757,32 +1063,43 @@ async def api_rechazar_solicitud(request: Request):
         print("ERROR EN RECHAZO:", str(e))
         return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
 
-@app.post("/api/confirmar-solicitud")
-async def api_confirmar_solicitud(body: ActionRequest):
-    r = await notion("pages/" + body.requestId, ENV_CONFIG, method="GET")
-    p = r.get("properties", {})
-    fecha = date_prop(p.get("Fecha"))
-    h_val = hora(p.get("Hora"))
-    
-    dt_base = datetime.fromisoformat(fecha + "T" + (h_val if len(h_val)==5 else "10:00") + ":00").replace(tzinfo=TZ)
-    h_utc = dt_base.astimezone(zoneinfo.ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
 
-    created = await notion("pages", ENV_CONFIG, {
-        "parent": {"database_id": DB_RES},
-        "properties": {
-            "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Reserva"}}]},
-            "Estado": {"select": {"name": "CONFIRMADA"}},
-            "Pago": {"select": {"name": "PENDIENTE"}},
-            "Fecha": {"date": {"start": fecha}},
-            "Hora": {"date": {"start": h_utc}},
-            "Jugadores": {"number": num(p.get("Jugadores"))},
-            "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}},
-            "Origen": {"select": {"name": prop(p.get("Origen")) or "WEB"}},
-            "Teléfono": {"phone_number": phone(p.get("Teléfono"))} if phone(p.get("Teléfono")) else {"phone_number": None}
-        }
-    })
-    await notion_update_page(body.requestId, ENV_CONFIG, {"Estado": {"select": {"name": "CONFIRMADA"}}})
-    return {"ok": True, "nombre": prop(p.get("Nombre")), "fecha": fecha, "hora": h_val}
+@app.post("/api/confirmar-solicitud")
+async def api_confirmar_solicitud(request: Request):
+    try:
+        body = await request.json()
+        request_id = body.get("requestId")
+        if not request_id:
+            raise HTTPException(status_code=400, detail="Falta el ID de la solicitud.")
+
+        r = await notion("pages/" + request_id, ENV_CONFIG, method="GET")
+        p = r.get("properties", {})
+        fecha = date_prop(p.get("Fecha"))
+        h_val = hora(p.get("Hora"))
+        
+        dt_base = datetime.fromisoformat(fecha + "T" + (h_val if len(h_val) == 5 else "10:00") + ":00").replace(tzinfo=TZ)
+        h_utc = dt_base.astimezone(zoneinfo.ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+
+        await notion("pages", ENV_CONFIG, {
+            "parent": {"database_id": DB_RES},
+            "properties": {
+                "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Reserva"}}]},
+                "Estado": {"select": {"name": "CONFIRMADA"}},
+                "Pago": {"select": {"name": "PENDIENTE"}},
+                "Fecha": {"date": {"start": fecha}},
+                "Hora": {"date": {"start": h_utc}},
+                "Jugadores": {"number": num(p.get("Jugadores"))},
+                "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}},
+                "Origen": {"select": {"name": prop(p.get("Origen")) or "WEB"}},
+                "Teléfono": {"phone_number": phone(p.get("Teléfono"))} if phone(p.get("Teléfono")) else {"phone_number": None}
+            }
+        }, method="POST")
+        await notion_update_page(request_id, ENV_CONFIG, {"Estado": {"select": {"name": "CONFIRMADA"}}})
+        return {"ok": True, "nombre": prop(p.get("Nombre")), "fecha": fecha, "hora": h_val}
+    except Exception as e:
+        print("ERROR EN CONFIRMAR:", str(e))
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+
 
 @app.post("/api/revisar-correo")
 async def api_revisar_correo():
@@ -1086,7 +1403,7 @@ let output="";
 a.forEach(function(x,i){
 output+='<div class="card"><strong>'+safe(x.nombre,"Sin nombre")+"</strong>";
 if(i===0){output+='<div class="badge">⭐ Próxima</div>';}
-output+='<div class="info">📅 '+safe(x.fechaTexto)+"<br>🕐 "+safe(x.horaTexto)+"<br>👥 "+safe(x.jugadores)+" personas<br>🎯 "+safe(x.version)+"</div>";
+output+='<div class="info">📅 '+safe(x.fechaTexto)+"<br>🕐 "+safe(n.horaTexto ? x.horaTexto : "")+"<br>👥 "+safe(x.jugadores)+" personas<br>🎯 "+safe(x.version)+"</div>";
 output+='<button class="action" onclick="marcarSesionRealizada(\\''+x.id+'\\')">✅ SESIÓN REALIZADA + PAGO RECIBIDO</button>';
 output+='<button class="suspend" onclick="abrirModalSuspender(\\''+x.id+'\\')">⚠️ SUSPENDER / CANCELAR RESERVA</button>';
 output+="</div>";
