@@ -3,13 +3,13 @@ import zoneinfo
 import re
 import os
 import httpx
+import urllib.parse
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Any
 from dotenv import load_dotenv
 
-# Cargar las variables del archivo .env
 load_dotenv()
 
 app = FastAPI()
@@ -22,6 +22,7 @@ ENV_CONFIG = {
 DB_SOL = "53f757ce-a190-4eea-9cf5-d03b107f04e6"
 DB_RES = "f0129517-1439-40e7-8130-931bfb1278ea"
 DB_SES = "7dc65dcfd88c4da2b8a1c5fa1ef8e777"
+DB_NO_REALIZADAS = "e694fcc30a19483fb5fc068cfa91ee87"
 
 HOSTINGER_MAILBOX = "AC76aebfc4d60a270d918b4549d4cd"
 
@@ -33,14 +34,19 @@ NV = "2022-06-28"
 # NOTION
 # =========================================================
 
-async def notion(url: str, env: dict, body: dict = None) -> dict:
+async def notion(url: str, env: dict, body: dict = None, method: str = "POST") -> dict:
     headers = {
         "Authorization": "Bearer " + env.get("NOTION_TOKEN", ""),
         "Notion-Version": NV,
         "Content-Type": "application/json"
     }
     async with httpx.AsyncClient() as client:
-        r = await client.post("https://api.notion.com/v1/" + url, headers=headers, json=body or {})
+        if method == "GET":
+            r = await client.get("https://api.notion.com/v1/" + url, headers=headers)
+        elif method == "PATCH":
+            r = await client.patch("https://api.notion.com/v1/" + url, headers=headers, json=body or {})
+        else:
+            r = await client.post("https://api.notion.com/v1/" + url, headers=headers, json=body or {})
     
     try:
         data = r.json() if r.text else {}
@@ -54,7 +60,6 @@ async def notion(url: str, env: dict, body: dict = None) -> dict:
         )
     return data
 
-
 async def query_all(database: str, env: dict, body: dict = None) -> list:
     results = []
     cursor = None
@@ -63,11 +68,13 @@ async def query_all(database: str, env: dict, body: dict = None) -> list:
         if cursor:
             b["start_cursor"] = cursor
         
-        data = await notion("databases/" + database + "/query", env, b)
-        results.extend(data.get("results", []))
-        
-        cursor = data.get("next_cursor") if data.get("has_more") else None
-        if not cursor:
+        try:
+            data = await notion("databases/" + database + "/query", env, b)
+            results.extend(data.get("results", []))
+            cursor = data.get("next_cursor") if data.get("has_more") else None
+            if not cursor:
+                break
+        except Exception:
             break
     return results
 
@@ -115,13 +122,27 @@ def date_prop(p: Any) -> str:
 def hora(p: Any) -> str:
     if not p:
         return ""
+    val = ""
     if p.get("date") and p["date"].get("start"):
-        return p["date"]["start"]
-    if isinstance(p.get("rich_text"), list) and len(p["rich_text"]) > 0:
-        return p["rich_text"][0].get("plain_text", "")
-    if isinstance(p.get("title"), list) and len(p["title"]) > 0:
-        return p["title"][0].get("plain_text", "")
-    return ""
+        val = p["date"]["start"]
+    elif isinstance(p.get("rich_text"), list) and len(p["rich_text"]) > 0:
+        val = p["rich_text"][0].get("plain_text", "")
+    elif isinstance(p.get("title"), list) and len(p["title"]) > 0:
+        val = p["title"][0].get("plain_text", "")
+    
+    if not val:
+        return ""
+    
+    try:
+        if "T" in val or ":" in val:
+            if not val.endswith("Z") and "+" not in val and "-" not in val[10:]:
+                val += "Z"
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            return dt.astimezone(TZ).strftime("%H:%M")
+    except Exception:
+        pass
+    
+    return val
 
 
 # =========================================================
@@ -171,40 +192,27 @@ def sort_key(x: dict) -> str:
     return f"{f}T{h}"
 
 
-# =========================================================
-# WHATSAPP
-# =========================================================
-
 def wa(tel: str, msg: str) -> str:
     if not tel:
         return ""
     n = re.sub(r"\D", "", str(tel))
     if not n:
         return ""
-    import urllib.parse
     return "https://wa.me/" + n + "?text=" + urllib.parse.quote(msg)
 
 
 # =========================================================
-# SOLICITUDES
+# SOLICITUDES, RESERVAS Y SESIONES
 # =========================================================
 
 async def solicitudes(env: dict):
     data = await query_all(
-        DB_SOL,
-        env,
+        DB_SOL, env,
         {
-            "filter": {
-                "property": "Estado",
-                "select": {"equals": "PENDIENTE"}
-            },
-            "sorts": [
-                {"property": "Fecha", "direction": "ascending"},
-                {"property": "Hora", "direction": "ascending"}
-            ]
+            "filter": {"property": "Estado", "select": {"equals": "PENDIENTE"}},
+            "sorts": [{"property": "Fecha", "direction": "ascending"}, {"property": "Hora", "direction": "ascending"}]
         }
     )
-    
     res = []
     for x in data:
         p = x.get("properties", {})
@@ -228,32 +236,18 @@ async def solicitudes(env: dict):
             "Si finalmente no estáis interesados, por favor contestad a este WhatsApp para que podamos ofrecer el horario a otros usuarios.\n\n"
             "¡Muchas gracias! 😊"
         )
-        
         res.append({
-            "id": x["id"],
-            "nombre": nombre,
-            "fecha": fecha,
-            "fechaTexto": fecha_texto,
-            "hora": hora_valor,
-            "horaTexto": hora_texto,
-            "jugadores": jugadores,
-            "version": version,
-            "telefono": tel,
-            "whatsapp": wa(tel, mensaje)
+            "id": x["id"], "nombre": nombre, "fecha": fecha, "fechaTexto": fecha_texto,
+            "hora": hora_valor, "horaTexto": hora_texto, "jugadores": jugadores,
+            "version": version, "telefono": tel, "whatsapp": wa(tel, mensaje)
         })
-    
     return sorted(res, key=sort_key)
 
-
-# =========================================================
-# RESERVAS
-# =========================================================
 
 async def reservas(env: dict):
     hoy = datetime.now(TZ).strftime("%Y-%m-%d")
     data = await query_all(
-        DB_RES,
-        env,
+        DB_RES, env,
         {
             "filter": {
                 "and": [
@@ -262,103 +256,138 @@ async def reservas(env: dict):
                     {"property": "Fecha", "date": {"on_or_after": hoy}}
                 ]
             },
-            "sorts": [
-                {"property": "Fecha", "direction": "ascending"},
-                {"property": "Hora", "direction": "ascending"}
-            ]
+            "sorts": [{"property": "Fecha", "direction": "ascending"}, {"property": "Hora", "direction": "ascending"}]
         }
     )
-    
     res = []
     for x in data:
         p = x.get("properties", {})
         fecha = date_prop(p.get("Fecha"))
         hora_valor = hora(p.get("Hora"))
         res.append({
-            "id": x["id"],
-            "nombre": prop(p.get("Nombre")),
-            "fecha": fecha,
-            "fechaTexto": fmt_date(fecha),
-            "hora": hora_valor,
-            "horaTexto": fmt_time(hora_valor),
-            "jugadores": num(p.get("Jugadores")),
-            "version": prop(p.get("Versión")),
-            "estado": prop(p.get("Estado")),
-            "pago": prop(p.get("Pago")),
-            "telefono": phone(p.get("Teléfono"))
+            "id": x["id"], "nombre": prop(p.get("Nombre")), "fecha": fecha,
+            "fechaTexto": fmt_date(fecha), "hora": hora_valor, "horaTexto": fmt_time(hora_valor),
+            "jugadores": num(p.get("Jugadores")), "version": prop(p.get("Versión")),
+            "estado": prop(p.get("Estado")), "pago": prop(p.get("Pago")), "telefono": phone(p.get("Teléfono"))
         })
-    
     return sorted(res, key=sort_key)
 
 
-# =========================================================
-# SESIONES
-# =========================================================
-
 async def sesiones_realizadas(env: dict):
-    data = await query_all(
-        DB_SES,
-        env,
-        {
-            "sorts": [
-                {"property": "Fecha", "direction": "descending"},
-                {"property": "Hora", "direction": "descending"}
-            ]
-        }
-    )
-    
+    data = await query_all(DB_SES, env, {"sorts": [{"property": "Fecha", "direction": "descending"}, {"property": "Hora", "direction": "descending"}]})
     res = []
     for x in data:
         p = x.get("properties", {})
         fecha = date_prop(p.get("Fecha"))
         hora_valor = hora(p.get("Hora"))
         res.append({
-            "id": x["id"],
-            "nombre": prop(p.get("Nombre")),
-            "fecha": fecha,
-            "fechaTexto": fmt_date(fecha),
-            "hora": hora_valor,
-            "horaTexto": fmt_time(hora_valor),
-            "jugadores": num(p.get("Jugadores")),
-            "version": prop(p.get("Versión")),
-            "origen": prop(p.get("Origen")),
-            "pago": prop(p.get("Pago"))
+            "id": x["id"], "nombre": prop(p.get("Nombre")), "fecha": fecha,
+            "fechaTexto": fmt_date(fecha), "hora": hora_valor, "horaTexto": fmt_time(hora_valor),
+            "jugadores": num(p.get("Jugadores")), "version": prop(p.get("Versión")),
+            "origen": prop(p.get("Origen")), "pago": prop(p.get("Pago"))
+        })
+    return res
+
+
+async def no_realizadas(env: dict):
+    data = await query_all(DB_NO_REALIZADAS, env, {"sorts": [{"property": "Fecha", "direction": "descending"}, {"property": "Hora", "direction": "descending"}]})
+    res = []
+    for x in data:
+        p = x.get("properties", {})
+        fecha = date_prop(p.get("Fecha"))
+        hora_valor = hora(p.get("Hora"))
+        res.append({
+            "id": x["id"], "nombre": prop(p.get("Nombre")), "fecha": fecha,
+            "fechaTexto": fmt_date(fecha), "hora": hora_valor, "horaTexto": fmt_time(hora_valor),
+            "jugadores": num(p.get("Jugadores")), "version": prop(p.get("Versión")),
+            "tipo": prop(p.get("Tipo")), "motivo": prop(p.get("Motivo")), "senal": prop(p.get("Señal"))
         })
     return res
 
 
 # =========================================================
-# ACTUALIZAR / ELIMINAR NOTION
+# HOSTINGER API & EXTRACCIÓN INTELIGENTE DE CORREOS
 # =========================================================
 
-async def notion_update_page(page_id: str, env: dict, properties: dict):
+async def hostinger_get(path: str, env: dict) -> dict:
+    headers = {
+        "Authorization": "Bearer " + env.get("HOSTINGER_TOKEN", ""),
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
     async with httpx.AsyncClient() as client:
-        r = await client.patch(
-            "https://api.notion.com/v1/pages/" + page_id,
-            headers={
-                "Authorization": "Bearer " + env.get("NOTION_TOKEN", ""),
-                "Notion-Version": NV,
-                "Content-Type": "application/json"
-            },
-            json={"properties": properties}
-        )
-    
+        r = await client.get("https://api.mail.hostinger.com" + path, headers=headers)
     try:
         data = r.json() if r.text else {}
     except Exception:
-        data = {"raw": r.text}
-
+        raise HTTPException(status_code=500, detail="Hostinger no devolvió JSON válido")
     if not (200 <= r.status_code < 300):
-        raise HTTPException(
-            status_code=r.status_code,
-            detail="Notion " + str(r.status_code) + " " + (data.get("message") or data.get("raw") or r.text or "Error")
-        )
+        raise HTTPException(status_code=r.status_code, detail="Hostinger error: " + r.text)
     return data
 
 
-# =========================================================
-# LÓGICA DE TIEMPOS Y VALIDACIÓN DE HUECOS
-# =========================================================
+async def hostinger_move(env: dict, uid: str) -> bool:
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            "https://api.mail.hostinger.com/api/v1/mailboxes/" + HOSTINGER_MAILBOX + "/folders/INBOX/messages/" + urllib.parse.quote(uid) + "/move",
+            headers={"Authorization": "Bearer " + env.get("HOSTINGER_TOKEN", ""), "Content-Type": "application/json"},
+            json={"targetFolder": "INBOX.Aceptadas"}
+        )
+    if not (200 <= r.status_code < 300):
+        async with httpx.AsyncClient() as client2:
+            await client2.post(
+                "https://api.mail.hostinger.com/api/v1/mailboxes/" + HOSTINGER_MAILBOX + "/folders/INBOX/messages/" + urllib.parse.quote(uid) + "/move",
+                headers={"Authorization": "Bearer " + env.get("HOSTINGER_TOKEN", ""), "Content-Type": "application/json"},
+                json={"targetFolder": "INBOX.Aceptadas"}
+            )
+    return True
+
+
+def mail_text(data: Any) -> str:
+    if isinstance(data, str):
+        return data
+    content = data.get("data") or data or {}
+    return "\n".join([
+        content.get("text", ""),
+        content.get("body", ""),
+        content.get("content", ""),
+        content.get("html", "")
+    ])
+
+
+def extract_date_from_mail(text: str) -> str:
+    m = re.search(r"\b(20\d{2})[-\/](\d{1,2})[-\/](\d{1,2})\b", text)
+    if m:
+        return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
+    m = re.search(r"\b(\d{1,2})[\/-](\d{1,2})[\/-](20\d{2})\b", text)
+    if m:
+        return f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
+    return ""
+
+
+def extract_time_from_mail(text: str) -> str:
+    m = re.search(r"\b([01]?\d|2[0-3])\s*[:hH\.]\s*([0-5]\d)\b", text)
+    if m:
+        return f"{m.group(1).zfill(2)}:{m.group(2)}"
+    m = re.search(r"\b([01]?\d|2[0-3])\s*h(?:oras?)?\b", text, re.IGNORECASE)
+    if m:
+        return f"{m.group(1).zfill(2)}:00"
+    return ""
+
+
+def extract_after_from_mail(text: str) -> str:
+    m = re.search(r"(?:a partir de|desde|después de|a las)\s*([01]?\d|2[0-3])(?:[:h\.]([0-5]\d))?", text, re.IGNORECASE)
+    if m:
+        return f"{m.group(1).zfill(2)}:{m.group(2) or '00'}"
+    return ""
+
+
+def extract_before_from_mail(text: str) -> str:
+    m = re.search(r"(?:antes de|hasta|no más tarde de)\s*([01]?\d|2[0-3])(?:[:h\.]([0-5]\d))?", text, re.IGNORECASE)
+    if m:
+        return f"{m.group(1).zfill(2)}:{m.group(2) or '00'}"
+    return ""
+
 
 def minutes_of(time_str: str) -> Optional[int]:
     m = re.match(r"^(\d{2}):(\d{2})$", time_str or "")
@@ -367,155 +396,194 @@ def minutes_of(time_str: str) -> Optional[int]:
     return int(m.group(1)) * 60 + int(m.group(2))
 
 
-def gap_for(version: str) -> int:
-    return 150 if version == "PRO" else 120
-
-
-def local_date_to_utc(date_str: str, time_str: str) -> str:
-    parts = time_str.split(":")
-    base = datetime.fromisoformat(date_str + "T" + parts[0].zfill(2) + ":" + parts[1] + ":00Z")
-    # Simplificación segura de offset para Madrid (UTC+1 / UTC+2)
-    return base.isoformat().replace("+00:00", "Z")
-
-
-def slot_is_valid(date_str: str, time: str, version: str, blocked: list, after: str, before: str) -> bool:
-    candidate = minutes_of(time)
-    if candidate is None or candidate % 30 != 0:
-        return False
-    if after != "" and candidate < minutes_of(after):
-        return False
-    if before != "" and candidate > minutes_of(before):
-        return False
-
-    for b in blocked:
-        if b.get("fecha") != date_str:
-            continue
-        bm = minutes_of(b.get("hora"))
-        if bm is None:
-            continue
-        required = max(gap_for(b.get("version", "NORMAL")), gap_for(version))
-        if abs(candidate - bm) < required:
-            return False
-    return True
-
-
-# =========================================================
-# CONFIRMAR / RECHAZAR / SESIÓN
-# =========================================================
-
-async def confirmar_solicitud_logic(env: dict, request_id: str):
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            "https://api.notion.com/v1/pages/" + request_id,
-            headers={
-                "Authorization": "Bearer " + env.get("NOTION_TOKEN", ""),
-                "Notion-Version": NV
-            }
-        )
-    if not (200 <= r.status_code < 300):
-        raise HTTPException(status_code=400, detail="No se pudo leer la solicitud: " + str(r.status_code))
+def resolver_hora_flexible(text: str, after: str, before: str) -> str:
+    texto_lower = text.lower()
+    # Las horas típicas de tarde mencionadas sin especificar se consideran tarde (18:00+)
+    mencion_tarde = any(w in texto_lower for w in ["seis", "siete", "ocho", "nueve", "diez", "tarde", "noches", "vesprada", "pm", "17:", "18:", "19:", "20:", "21:", "18h", "19h", "20h"])
+    es_tarde = mencion_tarde and not "mañana" in texto_lower
     
-    page = r.json()
-    p = page.get("properties", {})
-    fecha = date_prop(p.get("Fecha"))
-    hora_valor = hora(p.get("Hora"))
-    jugadores = num(p.get("Jugadores"))
-    version = prop(p.get("Versión")) or "NORMAL"
-    nombre = prop(p.get("Nombre")) or "Solicitud"
-    telefono = phone(p.get("Teléfono"))
-    origen = prop(p.get("Origen")) or "WEB"
-
-    if not fecha or not hora_valor:
-        raise HTTPException(status_code=400, detail="La solicitud no tiene fecha u hora válidas.")
-
-    all_res = await query_all(DB_RES, env, {})
-    all_sol = await query_all(DB_SOL, env, {})
-    blocked = []
-
-    for x in all_res:
-        rp = x.get("properties", {})
-        if date_prop(rp.get("Fecha")) == fecha and prop(rp.get("Estado")) == "CONFIRMADA":
-            blocked.append({"fecha": fecha, "hora": fmt_time(hora(rp.get("Hora"))), "version": prop(rp.get("Versión")) or "NORMAL"})
-
-    for x in all_sol:
-        if x["id"] == request_id:
-            continue
-        sp = x.get("properties", {})
-        if date_prop(sp.get("Fecha")) == fecha and prop(sp.get("Estado")) == "PENDIENTE":
-            blocked.append({"fecha": fecha, "hora": fmt_time(hora(sp.get("Hora"))), "version": prop(sp.get("Versión")) or "NORMAL"})
-
-    valida = slot_is_valid(fecha, fmt_time(hora_valor), version, blocked, "", "")
-    if not valida:
-        raise HTTPException(status_code=400, detail="⚠️ El horario ya no está disponible. La solicitud NO se ha confirmado.")
-
-    hora_utc = local_date_to_utc(fecha, fmt_time(hora_valor))
-
-    created = await notion("pages", env, {
-        "parent": {"database_id": DB_RES},
-        "properties": {
-            "Nombre": {"title": [{"text": {"content": nombre}}]},
-            "Estado": {"select": {"name": "CONFIRMADA"}},
-            "Pago": {"select": {"name": "PENDIENTE"}},
-            "Fecha": {"date": {"start": fecha}},
-            "Hora": {"date": {"start": hora_utc}},
-            "Jugadores": {"number": jugadores},
-            "Versión": {"select": {"name": version}},
-            "Origen": {"select": {"name": origen}},
-            "Teléfono": {"phone_number": telefono} if telefono else {"phone_number": None},
-            "Notas": {"rich_text": [{"text": {"content": "Reserva confirmada desde el panel. Solicitud original: " + request_id}}]}
-        }
-    })
-
-    await notion_update_page(request_id, env, {"Estado": {"select": {"name": "CONFIRMADA"}}})
-    return {"reservationId": created["id"], "nombre": nombre, "fecha": fecha, "hora": fmt_time(hora_valor)}
-
-
-async def marcar_sesion_realizada_logic(env: dict, reservation_id: str):
-    async with httpx.AsyncClient() as client:
-        reservation = await client.get(
-            "https://api.notion.com/v1/pages/" + reservation_id,
-            headers={
-                "Authorization": "Bearer " + env.get("NOTION_TOKEN", ""),
-                "Notion-Version": NV
-            }
-        )
-    if not (200 <= reservation.status_code < 300):
-        raise HTTPException(status_code=400, detail="No se pudo leer la reserva.")
+    objetivo_minutos = 18 * 60 + 30 if es_tarde else 12 * 60
     
-    page = reservation.json()
-    existing = await query_all(DB_SES, env, {
-        "filter": {"property": "Reserva original", "relation": {"contains": reservation_id}},
-        "page_size": 1
-    })
+    min_m = minutes_of(after) if after else (16 * 60 if es_tarde else 9 * 60)
+    max_m = minutes_of(before) if before else (22 * 60 if es_tarde else 15 * 60)
+    
+    mejor_slot = None
+    menor_distancia = 999999
+    
+    for h in range(0, 24):
+        for m in range(0, 60, 30):
+            total_m = h * 60 + m
+            if min_m <= total_m <= max_m:
+                dist = abs(total_m - objetivo_minutos)
+                if dist < menor_distancia:
+                    menor_distancia = dist
+                    mejor_slot = f"{str(h).zfill(2)}:{str(m).zfill(2)}"
+                    
+    return mejor_slot or ("18:30" if es_tarde else "12:00")
 
-    if existing:
-        await notion_update_page(reservation_id, env, {"Pago": {"select": {"name": "RECIBIDO"}}})
-        return {"alreadyExists": True}
-
-    p = page.get("properties", {})
-    await notion("pages", env, {
-        "parent": {"database_id": DB_SES},
-        "properties": {
-            "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Sesión"}}]},
-            "Fecha": {"date": {"start": date_prop(p.get("Fecha"))}},
-            "Hora": {"date": {"start": hora(p.get("Hora"))}},
-            "Jugadores": {"number": num(p.get("Jugadores"))},
-            "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}},
-            "Origen": {"select": {"name": prop(p.get("Origen")) or "WEB"}},
-            "Pago": {"select": {"name": "RECIBIDO"}},
-            "Fecha registro": {"date": {"start": datetime.now(TZ).isoformat()}},
-            "Notas": {"rich_text": [{"text": {"content": "Sesión realizada y pago recibido desde el panel."}}]},
-            "Reserva original": {"relation": [{"id": reservation_id}]}
-        }
-    })
-
-    await notion_update_page(reservation_id, env, {"Pago": {"select": {"name": "RECIBIDO"}}})
-    return {"alreadyExists": False}
+def extract_players_from_mail(text: str) -> Optional[int]:
+    patterns = [
+        r"(?:n[º°o]\s*)?(?:personas?|jugadores?|participantes?|pax)\s*[:\-]?\s*(\d{1,2})",
+        r"(\d{1,2})\s*(?:personas?|jugadores?|pax)"
+    ]
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    return None
 
 
+def extract_phone_from_mail(text: str) -> str:
+    if not text:
+        return ""
+    limpio = re.sub(r"<[^>]*>", " ", text)
+    patron = r"(?:\+34|0034)?[\s().-]*[6789](?:[\s().-]*\d){8}(?!\d)"
+    candidatos = re.findall(patron, limpio)
+    for c in candidatos:
+        digitos = re.sub(r"\D", "", c)
+        if digitos.startswith("0034") and len(digitos) == 13:
+            digitos = digitos[4:]
+        elif digitos.startswith("34") and len(digitos) == 11:
+            digitos = digitos[2:]
+        if len(digitos) == 9 and re.match(r"^[6789]\d{8}$", digitos):
+            return "+34" + digitos
+    return ""
+
+
+def extract_version_from_mail(text: str) -> str:
+    contenido = re.sub(r"[\u0300-\u036f]", "", text or "").upper()
+    if re.search(r"\bPRO\b", contenido):
+        return "PRO"
+    return "NORMAL"
+
+
+def extract_name_from_mail(text: str, subject: str) -> str:
+    m = re.search(r"Reserva[^:]*:\s*20\d{2}-\d{2}-\d{2}\s*-\s*(.+)$", subject, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"(?:nombre|name|equipo|grupo)\s*[:\-]\s*([^\r\n]+)", text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+async def revisar_correo_logic(env: dict):
+    if not env.get("HOSTINGER_TOKEN"):
+        raise HTTPException(status_code=400, detail="Falta el Token de Hostinger.")
+    
+    inbox = await hostinger_get("/api/v1/mailboxes/" + HOSTINGER_MAILBOX + "/folders/INBOX/messages?page=1&perPage=50", env)
+    messages = inbox.get("messages", []) or inbox.get("data", []) or inbox.get("results", [])
+    
+    if not isinstance(messages, list) or not messages:
+        return []
+
+    actions = []
+    for msg in messages:
+        uid = str(msg.get("uid") or msg.get("id") or "")
+        if not uid:
+            continue
+        
+        detail = await hostinger_get("/api/v1/mailboxes/" + HOSTINGER_MAILBOX + "/folders/INBOX/messages/" + uid + "/text", env)
+        subject = msg.get("subject") or detail.get("subject") or ""
+        text = subject + "\n" + mail_text(detail)
+
+        fecha = extract_date_from_mail(text)
+        hora_solicitada = extract_time_from_mail(text)
+        after = extract_after_from_mail(text)
+        before = extract_before_from_mail(text)
+        
+        # --- MEJORA 1: Detectar horas relativas ("seis", "siete", etc.) incluso si no ponen números ---
+        texto_lower = text.lower()
+        mencion_tarde = any(w in texto_lower for w in ["seis", "siete", "ocho", "nueve", "diez", "tarde", "noches", "vesprada", "pm", "17:", "18:", "19:", "20:", "21:", "18h", "19h", "20h"])
+        
+        if not hora_solicitada and (after or before or mencion_tarde or "mañana" in text.lower() or "10" in text or "11" in text or "17" in text):
+            hora_solicitada = resolver_hora_flexible(text, after, before)
+
+        jugadores = extract_players_from_mail(text)
+        version = extract_version_from_mail(text)
+        telefono = extract_phone_from_mail(text)
+        nombre = extract_name_from_mail(text, subject)
+
+        if not fecha or jugadores is None or not hora_solicitada:
+            continue
+
+        # --- MEJORA 2: Validación Anti-Doble Booking ---
+        # Comprobamos si ya existe una reserva confirmada en esa misma fecha y hora exactas
+        reservas_existentes = await reservas(env)
+        ocupado = any(r.get("fecha") == fecha and r.get("hora") == hora_solicitada for r in reservas_existentes)
+
+        if ocupado:
+            actions.append({
+                "type": "CONFLICT",
+                "uid": uid,
+                "subject": subject,
+                "nombre": nombre,
+                "fecha": fecha,
+                "hora": hora_solicitada,
+                "reason": "⚠️ CONFLICTO CRÍTICO: El horario solicitado ya está ocupado por otra reserva confirmada. No se ha creado la solicitud para evitar duplicados."
+            })
+            break
+        # -----------------------------------------------
+
+        dt_base = datetime.fromisoformat(fecha + "T" + hora_solicitada + ":00").replace(tzinfo=TZ)
+        hora_utc = dt_base.astimezone(zoneinfo.ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+
+        created = await notion("pages", env, {
+            "parent": {"database_id": DB_SOL},
+            "properties": {
+                "Nombre": {"title": [{"text": {"content": nombre or "Solicitud web"}}]},
+                "Estado": {"select": {"name": "PENDIENTE"}},
+                "Pago": {"select": {"name": "PENDIENTE"}},
+                "Fecha": {"date": {"start": fecha}},
+                "Hora": {"date": {"start": hora_utc}},
+                "Jugadores": {"number": jugadores},
+                "Versión": {"select": {"name": version}},
+                "Origen": {"select": {"name": "WEB"}},
+                "Teléfono": {"phone_number": telefono} if telefono else {"phone_number": None},
+                "Notas": {"rich_text": [{"text": {"content": f"Solicitud recibida por Hostinger INBOX. UID {uid}."}}]}
+            }
+        })
+
+        try:
+            await hostinger_move(env, uid)
+        except Exception:
+            pass
+
+        mensaje = (
+            f"Hola{((' ' + nombre) if nombre else '')}, escribo de Fugarte Escape Room.\n\n"
+            f"Tenemos disponibilidad el {fmt_date(fecha)} a las {hora_solicitada} para {jugadores} personas.\n\n"
+            "Si queréis confirmar la reserva, sería necesario hacer un Bizum de 10 € a este número de teléfono.\n\n"
+            "Una vez recibido, dejamos la reserva confirmada.\n\n"
+            "Si finalmente no estáis interesados, por favor contestad a este WhatsApp para que podamos ofrecer el horario a otros usuarios.\n\n"
+            "¡Muchas gracias! 😊"
+        )
+
+        actions.append({
+            "type": "CREATED",
+            "uid": uid,
+            "subject": subject,
+            "requestId": created["id"],
+            "nombre": nombre,
+            "fecha": fecha,
+            "hora": hora_solicitada,
+            "jugadores": jugadores,
+            "version": version,
+            "telefono": telefono,
+            "whatsapp": wa(telefono, mensaje),
+            "reason": "Solicitud creada en Notion y correo movido a INBOX.Aceptadas."
+        })
+        break
+
+    return actions
 # =========================================================
-# ENDPOINTS API FastAPI
+# ACCIONES DE NOTION Y ENDPOINTS API
 # =========================================================
+
+async def notion_update_page(page_id: str, env: dict, properties: dict):
+    await notion("pages/" + page_id, env, {"properties": properties}, method="PATCH")
+
+async def notion_archive_page(page_id: str, env: dict):
+    await notion("pages/" + page_id, env, {"archived": True}, method="PATCH")
 
 @app.get("/api/health")
 async def health():
@@ -533,38 +601,197 @@ async def api_reservas():
 async def api_sesiones():
     return await sesiones_realizadas(ENV_CONFIG)
 
+@app.get("/api/no-realizadas")
+async def api_no_realizadas():
+    return await no_realizadas(ENV_CONFIG)
+
 class ActionRequest(BaseModel):
     reservationId: Optional[str] = None
     requestId: Optional[str] = None
+    motivo: Optional[str] = None
+    senal: Optional[str] = None
 
 @app.post("/api/sesion-realizada")
 async def api_sesion_realizada(body: ActionRequest):
-    if not body.reservationId:
-        raise HTTPException(status_code=400, detail="Falta reservationId")
-    res = await marcar_sesion_realizada_logic(ENV_CONFIG, body.reservationId)
-    return {"ok": True, **res}
+    reservation = await notion("pages/" + body.reservationId, ENV_CONFIG, method="GET")
+    p = reservation.get("properties", {})
+    
+    await notion("pages", ENV_CONFIG, {
+        "parent": {"database_id": DB_SES},
+        "properties": {
+            "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Sesión"}}]},
+            "Fecha": {"date": {"start": date_prop(p.get("Fecha"))}},
+            "Hora": {"date": {"start": hora(p.get("Hora"))}},
+            "Jugadores": {"number": num(p.get("Jugadores"))},
+            "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}},
+            "Origen": {"select": {"name": prop(p.get("Origen")) or "WEB"}},
+            "Pago": {"select": {"name": "RECIBIDO"}},
+            "Fecha registro": {"date": {"start": datetime.now(TZ).isoformat()}},
+            "Reserva original": {"relation": [{"id": body.reservationId}]}
+        }
+    })
+    await notion_update_page(body.reservationId, ENV_CONFIG, {"Pago": {"select": {"name": "RECIBIDO"}}})
+    return {"ok": True, "alreadyExists": False}
+
+@app.post("/api/suspender-reserva")
+async def api_suspender_reserva(request: Request):
+    try:
+        body = await request.json()
+        reservation_id = body.get("reservationId")
+        motivo = body.get("motivo")
+        senal = body.get("senal")
+
+        if not reservation_id:
+            raise HTTPException(status_code=400, detail="Falta el ID de la reserva a suspender.")
+            
+        # 1. Consultar la página existente usando method="GET"
+        reservation = await notion("pages/" + reservation_id, ENV_CONFIG, method="GET")
+        p = reservation.get("properties", {})
+        
+        fecha_val = date_prop(p.get("Fecha"))
+        h_val = hora(p.get("Hora"))
+        
+        # Construir formato ISO válido combinando fecha y hora para Notion
+        hora_iso = None
+        if fecha_val:
+            t_str = h_val if (h_val and len(h_val) == 5) else "10:00"
+            try:
+                dt_base = datetime.fromisoformat(fecha_val + "T" + t_str + ":00").replace(tzinfo=TZ)
+                hora_iso = dt_base.astimezone(zoneinfo.ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+            except Exception:
+                hora_iso = fecha_val + "T10:00:00Z"
+
+        props = {
+            "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Reserva suspendida"}}]},
+            "Fecha": {"date": {"start": fecha_val}} if fecha_val else {"date": None},
+            "Hora": {"date": {"start": hora_iso}} if hora_iso else {"date": None},
+            "Jugadores": {"number": num(p.get("Jugadores"))},
+            "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}}
+        }
+        
+        tel = phone(p.get("Teléfono"))
+        if tel:
+            props["Teléfono"] = {"phone_number": tel}
+
+        if motivo:
+            props["Motivo"] = {"select": {"name": motivo}}
+        if senal:
+            props["Señal"] = {"select": {"name": senal}}
+        
+        props["Tipo"] = {"select": {"name": "SUSPENDIDA"}}
+
+        # 2. Crear el registro en el histórico
+        await notion("pages", ENV_CONFIG, {
+            "parent": {"database_id": DB_NO_REALIZADAS},
+            "properties": props
+        }, method="POST")
+        
+        # 3. Archivar o cancelar la reserva original
+        try:
+            await notion_archive_page(reservation_id, ENV_CONFIG)
+        except Exception:
+            await notion_update_page(reservation_id, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
+
+        return {"ok": True}
+        
+    except Exception as e:
+        print("ERROR EN SUSPENSIÓN:", str(e))
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+
+
+@app.post("/api/rechazar-solicitud")
+async def api_rechazar_solicitud(request: Request):
+    try:
+        body = await request.json()
+        request_id = body.get("requestId")
+        motivo = body.get("motivo")
+
+        if not request_id:
+            raise HTTPException(status_code=400, detail="Falta el ID de la solicitud.")
+
+        r = await notion("pages/" + request_id, ENV_CONFIG, method="GET")
+        p = r.get("properties", {})
+        
+        fecha_val = date_prop(p.get("Fecha"))
+        h_val = hora(p.get("Hora"))
+        
+        hora_iso = None
+        if fecha_val:
+            t_str = h_val if (h_val and len(h_val) == 5) else "10:00"
+            try:
+                dt_base = datetime.fromisoformat(fecha_val + "T" + t_str + ":00").replace(tzinfo=TZ)
+                hora_iso = dt_base.astimezone(zoneinfo.ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+            except Exception:
+                hora_iso = fecha_val + "T10:00:00Z"
+        
+        props = {
+            "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Solicitud rechazada"}}]},
+            "Fecha": {"date": {"start": fecha_val}} if fecha_val else {"date": None},
+            "Hora": {"date": {"start": hora_iso}} if hora_iso else {"date": None},
+            "Jugadores": {"number": num(p.get("Jugadores"))},
+            "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}}
+        }
+        
+        tel = phone(p.get("Teléfono"))
+        if tel:
+            props["Teléfono"] = {"phone_number": tel}
+
+        if motivo:
+            props["Motivo"] = {"select": {"name": motivo}}
+        
+        props["Tipo"] = {"select": {"name": "RECHAZADA"}}
+
+        await notion("pages", ENV_CONFIG, {
+            "parent": {"database_id": DB_NO_REALIZADAS},
+            "properties": props
+        }, method="POST")
+
+        try:
+            await notion_archive_page(request_id, ENV_CONFIG)
+        except Exception:
+            await notion_update_page(request_id, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
+
+        return {"ok": True}
+        
+    except Exception as e:
+        print("ERROR EN RECHAZO:", str(e))
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
 
 @app.post("/api/confirmar-solicitud")
 async def api_confirmar_solicitud(body: ActionRequest):
-    if not body.requestId:
-        raise HTTPException(status_code=400, detail="Falta requestId")
-    res = await confirmar_solicitud_logic(ENV_CONFIG, body.requestId)
-    return {"ok": True, **res}
+    r = await notion("pages/" + body.requestId, ENV_CONFIG, method="GET")
+    p = r.get("properties", {})
+    fecha = date_prop(p.get("Fecha"))
+    h_val = hora(p.get("Hora"))
+    
+    dt_base = datetime.fromisoformat(fecha + "T" + (h_val if len(h_val)==5 else "10:00") + ":00").replace(tzinfo=TZ)
+    h_utc = dt_base.astimezone(zoneinfo.ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
 
-@app.post("/api/rechazar-solicitud")
-async def api_rechazar_solicitud(body: ActionRequest):
-    if not body.requestId:
-        raise HTTPException(status_code=400, detail="Falta requestId")
-    await notion_update_page(body.requestId, ENV_CONFIG, {"Estado": {"select": {"name": "CANCELADA"}}})
-    return {"ok": True}
+    created = await notion("pages", ENV_CONFIG, {
+        "parent": {"database_id": DB_RES},
+        "properties": {
+            "Nombre": {"title": [{"text": {"content": prop(p.get("Nombre")) or "Reserva"}}]},
+            "Estado": {"select": {"name": "CONFIRMADA"}},
+            "Pago": {"select": {"name": "PENDIENTE"}},
+            "Fecha": {"date": {"start": fecha}},
+            "Hora": {"date": {"start": h_utc}},
+            "Jugadores": {"number": num(p.get("Jugadores"))},
+            "Versión": {"select": {"name": prop(p.get("Versión")) or "NORMAL"}},
+            "Origen": {"select": {"name": prop(p.get("Origen")) or "WEB"}},
+            "Teléfono": {"phone_number": phone(p.get("Teléfono"))} if phone(p.get("Teléfono")) else {"phone_number": None}
+        }
+    })
+    await notion_update_page(body.requestId, ENV_CONFIG, {"Estado": {"select": {"name": "CONFIRMADA"}}})
+    return {"ok": True, "nombre": prop(p.get("Nombre")), "fecha": fecha, "hora": h_val}
 
 @app.post("/api/revisar-correo")
 async def api_revisar_correo():
-    return {"ok": True, "actions": []}
+    actions = await revisar_correo_logic(ENV_CONFIG)
+    return {"ok": True, "actions": actions}
 
 
 # =========================================================
-# HTML FRONTEND (COMPLETO CON BOTONES)
+# HTML FRONTEND (INTERFAZ COMPLETA + MODALES DESPLEGABLES)
 # =========================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -575,7 +802,7 @@ async def panel():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Fugarte - Panel de Revisión</title>
+<title>Fugarte - Revisar</title>
 <style>
 *{box-sizing:border-box}
 body{margin:0;font-family:Arial,sans-serif;background:#f4f5f7;color:#222}
@@ -590,16 +817,27 @@ button,.wa{display:block;width:100%;padding:13px;border:0;border-radius:10px;bac
 .refresh{background:#2563eb}
 .mail{background:#7c3aed}
 .action{background:#dc2626}
+.suspend{background:#d97706}
 .small{font-size:13px;color:#666}
 .empty{text-align:center;color:#666;padding:20px}
 .badge{display:inline-block;padding:4px 8px;border-radius:8px;background:#eee;margin-top:5px;font-size:13px}
 .error{color:#b91c1c;font-weight:bold}
+.dropdown-btn{background:#4b5563;margin-top:8px}
+.dropdown-content{display:none;margin-top:10px;padding-left:10px;border-left:3px solid #e5e7eb}
+
+/* Estilos para los modales desplegables */
+.modal{display:none;position:fixed;z-index:100;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,0.5);justify-content:center;align-items:center}
+.modal-content{background:#fff;padding:20px;border-radius:14px;width:90%;max-width:400px;box-shadow:0 4px 15px #0003}
+.modal-content label{display:block;font-weight:bold;margin-top:12px;margin-bottom:5px}
+.modal-content select{width:100%;padding:10px;border-radius:8px;border:1px solid #ccc;font-size:15px}
+.modal-btns{display:flex;gap:10px;margin-top:20px}
+.modal-btns button{margin-top:0}
 </style>
 </head>
 <body>
 <header>
 <h1>Fugarte Escape Room</h1>
-<div>Panel de revisión (Python)</div>
+<div>Panel de revisión</div>
 </header>
 <main>
 <div class="card">
@@ -622,22 +860,69 @@ Revisa INBOX, comprueba Notion y disponibilidad, crea la solicitud y se detiene 
 <div class="title">📚 Sesiones realizadas</div>
 <div id="ses">Cargando...</div>
 </div>
+<div class="card">
+<div class="title">🚫 Histórico No Realizadas (Suspendidas / Rechazadas)</div>
+<div id="no-realizadas">Cargando...</div>
+</div>
 <button class="refresh" onclick="cargar()">🔄 Actualizar</button>
 </main>
+
+<!-- Modal para Suspender Reserva -->
+<div id="modalSuspender" class="modal">
+<div class="modal-content">
+<div class="title">⚠️ Suspender / Cancelar Reserva</div>
+<label for="selectMotivoSusp">Motivo de la suspensión:</label>
+<select id="selectMotivoSusp">
+<option value="Suspende cliente">Suspende cliente</option>
+<option value="Suspendemos nosotros">Suspendemos nosotros</option>
+</select>
+<label for="selectSenal">Señal de 10 €:</label>
+<select id="selectSenal">
+<option value="Devuelta">Devuelta</option>
+<option value="No devuelta">No devuelta</option>
+<option value="N/A">N/A</option>
+</select>
+<div class="modal-btns">
+<button class="action" onclick="ejecutarSuspension()">Confirmar</button>
+<button class="refresh" onclick="cerrarModales()">Cancelar</button>
+</div>
+</div>
+</div>
+
+<!-- Modal para Rechazar Solicitud -->
+<div id="modalRechazar" class="modal">
+<div class="modal-content">
+<div class="title">❌ Rechazar Solicitud</div>
+<label for="selectMotivoRech">Motivo del rechazo:</label>
+<select id="selectMotivoRech">
+<option value="Rechazada por el cliente">Rechazada por el cliente</option>
+<option value="Rechazada por nosotros">Rechazada por nosotros</option>
+</select>
+<div class="modal-btns">
+<button class="action" onclick="ejecutarRechazo()">Confirmar</button>
+<button class="refresh" onclick="cerrarModales()">Cancelar</button>
+</div>
+</div>
+</div>
+
 <script>
 function safe(value, fallback){
 if(value===null||value===undefined||value===""){return fallback||"";}
 return String(value);
 }
 
+let targetIdToProcess = null;
+
 async function cargar(){
 const sol=document.getElementById("sol");
 const res=document.getElementById("res");
 const ses=document.getElementById("ses");
+const noRealizadas=document.getElementById("no-realizadas");
 const next=document.getElementById("next");
 sol.innerHTML="Cargando...";
 res.innerHTML="Cargando...";
 ses.innerHTML="Cargando...";
+noRealizadas.innerHTML="Cargando...";
 next.innerHTML="";
 
 async function leerArray(url, nombre){
@@ -654,17 +939,21 @@ throw new Error(nombre+" devolvió un formato inesperado");
 const resultados=await Promise.allSettled([
 leerArray("/api/solicitudes", "Solicitudes"),
 leerArray("/api/reservas", "Reservas"),
-leerArray("/api/sesiones", "Sesiones")
+leerArray("/api/sesiones", "Sesiones"),
+leerArray("/api/no-realizadas", "No Realizadas")
 ]);
 
 if(resultados[0].status==="fulfilled"){mostrarSolicitudes(resultados[0].value);}
-else{sol.innerHTML='<div class="error">❌ Error al cargar las solicitudes: '+safe(resultados[0].reason?.message,"error")+'</div>';}
+else{sol.innerHTML='<div class="error">❌ Error al cargar solicitudes: '+safe(resultados[0].reason?.message,"error")+'</div>';}
 
 if(resultados[1].status==="fulfilled"){mostrarReservas(resultados[1].value);}
-else{res.innerHTML='<div class="error">❌ Error al cargar las reservas: '+safe(resultados[1].reason?.message,"error")+'</div>';}
+else{res.innerHTML='<div class="error">❌ Error al cargar reservas: '+safe(resultados[1].reason?.message,"error")+'</div>';}
 
-if(resultados[2].status==="fulfilled"){mostrarSesiones(resultados[2].value);}
-else{ses.innerHTML='<div class="error">❌ Error al cargar las sesiones: '+safe(resultados[2].reason?.message,"error")+'</div>';}
+if(resultados[2].status==="fulfilled"){mostrarSesionesDesplegable(resultados[2].value, "ses");}
+else{ses.innerHTML='<div class="error">❌ Error al cargar sesiones: '+safe(resultados[2].reason?.message,"error")+'</div>';}
+
+if(resultados[3].status==="fulfilled"){mostrarSesionesDesplegable(resultados[3].value, "no-realizadas");}
+else{noRealizadas.innerHTML='<div class="error">❌ Error al cargar histórico: '+safe(resultados[3].reason?.message,"error")+'</div>';}
 }
 
 async function revisarCorreo(){
@@ -714,16 +1003,51 @@ await cargar();
 }catch(e){alert("❌ "+e.message);}
 }
 
-async function rechazarSolicitud(requestId){
-if(!requestId){alert("No se ha encontrado el ID.");return;}
-if(!confirm("¿Seguro que quieres rechazar esta solicitud?"))return;
+function abrirModalRechazar(requestId){
+targetIdToProcess = requestId;
+document.getElementById("modalRechazar").style.display = "flex";
+}
+
+async function ejecutarRechazo(){
+if(!targetIdToProcess) return;
+const motivo = document.getElementById("selectMotivoRech").value;
+const idToSend = targetIdToProcess;
+cerrarModales();
+
 try{
-const r=await fetch("/api/rechazar-solicitud",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({requestId})});
+const r=await fetch("/api/rechazar-solicitud",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({requestId: idToSend, motivo: motivo})});
 const data=await r.json();
 if(!r.ok||!data.ok)throw new Error(data.error||"No se pudo rechazar");
-alert("✅ Solicitud cancelada.");
+alert("✅ Solicitud rechazada y movida al histórico.");
 await cargar();
 }catch(e){alert("❌ "+e.message);}
+}
+
+function abrirModalSuspender(reservationId){
+targetIdToProcess = reservationId;
+document.getElementById("modalSuspender").style.display = "flex";
+}
+
+async function ejecutarSuspension(){
+if(!targetIdToProcess) return;
+const motivo = document.getElementById("selectMotivoSusp").value;
+const senal = document.getElementById("selectSenal").value;
+const idToSend = targetIdToProcess;
+cerrarModales();
+
+try{
+const r=await fetch("/api/suspender-reserva",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({reservationId: idToSend, motivo: motivo, senal: senal})});
+const data=await r.json();
+if(!r.ok||!data.ok)throw new Error(data.error||"No se pudo suspender la reserva");
+alert("✅ Reserva suspendida y movida al histórico.");
+await cargar();
+}catch(e){alert("❌ "+e.message);}
+}
+
+function cerrarModales(){
+document.getElementById("modalSuspender").style.display = "none";
+document.getElementById("modalRechazar").style.display = "none";
+targetIdToProcess = null;
 }
 
 async function marcarSesionRealizada(reservationId){
@@ -746,7 +1070,7 @@ output+="<strong>"+safe(x.nombre,"Sin nombre")+"</strong>";
 output+='<div class="info">📅 '+safe(x.fechaTexto,"Sin fecha")+"<br>🕐 "+safe(x.horaTexto,"Sin hora")+"<br>👥 "+safe(x.jugadores,"Sin dato")+" personas<br>🎯 "+safe(x.version,"Sin versión")+"</div>";
 if(x.whatsapp){output+='<a class="wa" href="'+x.whatsapp+'" target="_blank" rel="noopener">💬 Abrir WhatsApp</a>';}
 output+='<button class="action" onclick="confirmarSolicitud(\\''+x.id+'\\')">✅ CONFIRMAR RESERVA</button>';
-output+='<button class="action" onclick="rechazarSolicitud(\\''+x.id+'\\')">❌ RECHAZAR SOLICITUD</button>';
+output+='<button class="action" onclick="abrirModalRechazar(\\''+x.id+'\\')">❌ RECHAZAR SOLICITUD</button>';
 output+="</div>";
 });
 document.getElementById("sol").innerHTML=output;
@@ -762,21 +1086,76 @@ let output="";
 a.forEach(function(x,i){
 output+='<div class="card"><strong>'+safe(x.nombre,"Sin nombre")+"</strong>";
 if(i===0){output+='<div class="badge">⭐ Próxima</div>';}
-output+='<div class="info">📅 '+safe(x.fechaTexto)+"<br>🕐 "+safe(x.horaTexto)+"<br>👥 "+safe(x.jugadores)+" personas<br>🎯 "+safe(n.version)+"</div>";
+output+='<div class="info">📅 '+safe(x.fechaTexto)+"<br>🕐 "+safe(x.horaTexto)+"<br>👥 "+safe(x.jugadores)+" personas<br>🎯 "+safe(x.version)+"</div>";
 output+='<button class="action" onclick="marcarSesionRealizada(\\''+x.id+'\\')">✅ SESIÓN REALIZADA + PAGO RECIBIDO</button>';
+output+='<button class="suspend" onclick="abrirModalSuspender(\\''+x.id+'\\')">⚠️ SUSPENDER / CANCELAR RESERVA</button>';
 output+="</div>";
 });
 document.getElementById("res").innerHTML=output;
 }
 
-function mostrarSesiones(a){
-if(!Array.isArray(a)||!a.length){document.getElementById("ses").innerHTML='<div class="empty">Todavía no hay sesiones.</div>';return;}
-let output="";
-a.slice(0,30).forEach(function(x){
-output+='<div class="card"><strong>'+safe(x.nombre,"Sin nombre")+"</strong>";
-output+='<div class="info">📅 '+safe(x.fechaTexto)+"<br>🕐 "+safe(x.horaTexto)+"<br>👥 "+safe(x.jugadores)+" personas<br>🎯 "+safe(x.version)+"<br>💶 Pago: "+safe(x.pago,"RECIBIDO")+"</div></div>";
+function mostrarSesionesDesplegable(a, containerId){
+if(!Array.isArray(a)||!a.length){document.getElementById(containerId).innerHTML='<div class="empty">No hay registros.</div>';return;}
+
+const arbol = {};
+const mesesNombres = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
+
+a.forEach(function(x){
+if(!x.fecha) return;
+const partes = x.fecha.split("-");
+if(partes.length < 2) return;
+const anio = partes[0];
+const mesNum = parseInt(partes[1], 10);
+const mesNombre = mesesNombres[mesNum] || partes[1];
+
+if(!arbol[anio]) arbol[anio] = {};
+if(!arbol[anio][mesNombre]) arbol[anio][mesNombre] = [];
+arbol[anio][mesNombre].push(x);
 });
-document.getElementById("ses").innerHTML=output;
+
+const aniosOrdenados = Object.keys(arbol).sort().reverse();
+let output = "";
+
+aniosOrdenados.forEach(function(anio){
+output += `<button class="dropdown-btn" onclick="toggleAnio('${containerId}', '${anio}')">📁 Año ${anio} ▾</button>`;
+output += `<div id="anio-${containerId}-${anio}" class="dropdown-content">`;
+
+const mesesOrdenados = Object.keys(arbol[anio]).sort(function(m1, m2){
+return mesesNombres.indexOf(m2) - mesesNombres.indexOf(m1);
+});
+
+mesesOrdenados.forEach(function(mes){
+output += `<button class="dropdown-btn" onclick="toggleMes('${containerId}', '${anio}', '${mes}')" style="background:#6b7280; font-size:15px;">📂 ${mes} ▾</button>`;
+output += `<div id="mes-${containerId}-${anio}-${mes}" class="dropdown-content">`;
+
+arbol[anio][mes].forEach(function(x){
+output += `<div class="card" style="margin-top:8px; margin-bottom:8px; background:#f9fafb;">`;
+output += `<strong>${safe(x.nombre,"Sin nombre")}</strong>`;
+output += `<div class="info">📅 ${safe(x.fechaTexto)}<br>🕐 ${safe(x.horaTexto)}<br>👥 ${safe(x.jugadores)} personas<br>🎯 ${safe(x.version)}`;
+if(x.tipo) output += `<br>📌 Tipo: ${safe(x.tipo)}`;
+if(x.motivo) output += `<br>ℹ️ Motivo: ${safe(x.motivo)}`;
+if(x.senal) output += `<br>💶 Señal: ${safe(x.senal)}`;
+if(x.pago) output += `<br>💶 Pago: ${safe(x.pago)}`;
+output += `</div></div>`;
+});
+
+output += `</div>`;
+});
+
+output += `</div>`;
+});
+
+document.getElementById(containerId).innerHTML = output || '<div class="empty">No hay registros.</div>';
+}
+
+function toggleAnio(containerId, anio){
+const el = document.getElementById("anio-" + containerId + "-" + anio);
+if(el){ el.style.display = (el.style.display === "block") ? "none" : "block"; }
+}
+
+function toggleMes(containerId, anio, mes){
+const el = document.getElementById("mes-" + containerId + "-" + anio + "-" + mes);
+if(el){ el.style.display = (el.style.display === "block") ? "none" : "block"; }
 }
 
 cargar();
